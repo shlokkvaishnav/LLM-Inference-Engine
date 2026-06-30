@@ -1,0 +1,37 @@
+services:
+  # GPU API server — requires NVIDIA Container Toolkit
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_NAME=${MODEL_NAME:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}
+      - DEVICE=cuda
+    volumes:
+      # Mount HuggingFace cache so weights survive container restarts
+      - hf_cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # CPU-only variant for local dev (no GPU needed)
+  api-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    ports:
+      - "8001:8000"
+    environment:
+      - MODEL_NAME=${MODEL_NAME:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}
+      - DEVICE=cpu
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+
+volumes:
+  hf_cache:
