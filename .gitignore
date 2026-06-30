@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Model weights — download separately, never commit
+*.bin
+*.safetensors
+*.gguf
+*.pt
+*.pth
+models/
+~/.cache/huggingface/
+
+# Benchmark output — committed selectively, not automatically
+benchmarks/results/*.png
+benchmarks/results/*.json
+benchmarks/results/*.csv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env files
+.env
+*.env.local
