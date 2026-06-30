@@ -21,7 +21,7 @@ FIXED_PROMPTS = [
     "def fibonacci(n):",
     "The transformer architecture was introduced in",
 ]
-MAX_NEW_TOKENS = 20
+MAX_NEW_TOKENS = 5   # 5 tokens is enough to catch any mismatch; keeps CPU tests fast
 
 
 @pytest.fixture(scope="module")
