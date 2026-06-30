@@ -12,7 +12,9 @@ from mini_vllm.engine.sequence import Sequence, SamplingParams, SequenceStatus
 from mini_vllm.model.loader import ModelConfig, load_model
 from mini_vllm.model.runner import ModelRunner
 
-MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+# GPT-2 for local CPU correctness tests: 124M params, loads in seconds.
+# TinyLlama is the production model on Kaggle — same code, different config.
+MODEL = "gpt2"
 
 # Fixed prompts used consistently across all correctness checks.
 FIXED_PROMPTS = [
@@ -50,6 +52,7 @@ def _hf_generate(model, tokenizer, prompt: str, max_new_tokens: int) -> list[int
         out = model.generate(
             input_ids,
             max_new_tokens=max_new_tokens,
+            max_length=None,          # suppress conflict with model's default max_length
             do_sample=False,          # greedy
             temperature=1.0,
             use_cache=True,
