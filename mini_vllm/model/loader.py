@@ -47,7 +47,7 @@ def load_model(config: ModelConfig) -> tuple[nn.Module, Any]:
 
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name_or_path,
-        dtype=torch_dtype,            # transformers 5.x renamed torch_dtype → dtype
+        torch_dtype=torch_dtype,
         trust_remote_code=config.trust_remote_code,
     )
     model = model.to(config.device)
