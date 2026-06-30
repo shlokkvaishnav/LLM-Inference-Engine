@@ -22,3 +22,9 @@ _PREFIXES = ("transformers", "tokenizers", "huggingface_hub")
 for _k in list(sys.modules.keys()):
     if any(_k == p or _k.startswith(p + ".") for p in _PREFIXES):
         del sys.modules[_k]
+
+# Eagerly load from TARGET so sys.modules is locked before any pytest plugin
+# hook or fixture can pull in the system version.
+if os.path.isdir(_TARGET):
+    import transformers  # noqa: E402
+    import tokenizers    # noqa: E402
