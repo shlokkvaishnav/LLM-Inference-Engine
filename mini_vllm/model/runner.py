@@ -48,11 +48,24 @@ def _slice_kv(past_kv: Any, i: int) -> Any:
     Extract sequence i from a batched cache. Preserves the cache type so the
     sliced result can be passed straight back to the model without conversion.
 
-    DynamicCache (transformers 4.38+): build a new DynamicCache with batch=1
-      by slicing each layer tensor along dim 0.
-    Legacy tuple-of-tuples: use index access [0][1] to avoid the 3-element
-      unpack error that appears with some transformers 5.x DynamicCache iters.
+    DynamicCache has had two incompatible internal layouts across transformers
+    versions, so we handle both — pinning one exact transformers version isn't
+    possible here since Kaggle and CI install different versions:
+      - transformers <5.x (e.g. 4.46.3, pinned on Kaggle): per-layer tensors
+        live in flat `.key_cache` / `.value_cache` lists on the DynamicCache.
+      - transformers >=5.x (unpinned CI): those lists are gone. Each layer is
+        now a `CacheLayerMixin` object in `.layers`, exposing `.keys`/`.values`.
+        Rebuild via `DynamicCache(ddp_cache_data=[(k, v), ...])` — the
+        documented constructor for building a cache from raw K/V tensors.
+    Legacy tuple-of-tuples (very old / non-Cache path): index access [0][1]
+      avoids the 3-element unpack error some DynamicCache iterators raise.
     """
+    if hasattr(past_kv, "layers"):
+        from transformers.cache_utils import DynamicCache
+        return DynamicCache(ddp_cache_data=[
+            (layer.keys[i : i + 1].contiguous(), layer.values[i : i + 1].contiguous())
+            for layer in past_kv.layers
+        ])
     if hasattr(past_kv, "key_cache") and hasattr(past_kv, "value_cache"):
         try:
             from transformers.cache_utils import DynamicCache
