@@ -16,7 +16,14 @@ downloading TinyLlama's real weights.
 num_key_value_heads < num_attention_heads exercises the GQA head-expansion
 path in PagedLlamaRunner (most real Llama models, including TinyLlama, use
 GQA — a bug there wouldn't be caught by an MHA-only config).
+
+test_paged_llama_matches_hf_on_real_model (bottom of this file) runs the
+same comparison against the real TinyLlama-1.1B weights on GPU — gated on
+MINI_VLLM_TEST_DEVICE=cuda since it needs real hardware and downloads the
+model; runs on Kaggle, skipped everywhere else.
 """
+import os
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -27,6 +34,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 from mini_vllm.engine.sequence import Sequence, SamplingParams
 from mini_vllm.engine.llm_engine import LLMEngine
 from mini_vllm.kv_cache.block_manager import BlockManager
+from mini_vllm.model.loader import ModelConfig, load_model
 from mini_vllm.model.paged_llama_runner import PagedLlamaRunner
 from mini_vllm.model.runner import ModelRunner
 
@@ -128,3 +136,65 @@ def test_paged_llama_releases_blocks_on_finish(tiny_model):
     engine.run_until_done()
 
     assert block_manager.num_free_blocks == block_manager.num_blocks
+
+
+@pytest.mark.skipif(
+    os.environ.get("MINI_VLLM_TEST_DEVICE") != "cuda",
+    reason="Real-model paged run needs GPU + a TinyLlama download — verified on Kaggle",
+)
+def test_paged_llama_matches_hf_on_real_model():
+    """
+    End-to-end proof on the actual production model: PagedLlamaRunner +
+    LLMEngine (paged, Triton kernel on GPU) must match transformers.generate()
+    token-for-token on real TinyLlama-1.1B weights — not just the tiny
+    random-weight architecture check above.
+    """
+    real_prompts = [
+        "The capital of France is",
+        "Once upon a time in a land far away,",
+        "def fibonacci(n):",
+    ]
+    max_new_tokens = 5
+
+    config = ModelConfig(
+        model_name_or_path=os.environ.get(
+            "MINI_VLLM_TEST_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        ),
+        dtype="float16",
+        device="cuda",
+        max_model_len=512,
+    )
+    model, tokenizer = load_model(config)
+
+    # HF ground truth.
+    expected = []
+    for prompt in real_prompts:
+        input_ids = tokenizer.encode(prompt, return_tensors="pt").to("cuda")
+        with torch.no_grad():
+            out = model.generate(
+                input_ids, max_new_tokens=max_new_tokens, max_length=None,
+                do_sample=False, temperature=1.0, use_cache=True,
+            )
+        expected.append(out[0, input_ids.shape[1]:].tolist())
+
+    # Paged path.
+    block_manager = BlockManager(num_blocks=256, block_size=16)
+    paged_runner = PagedLlamaRunner(
+        model, tokenizer, block_manager, dtype=torch.float16, device="cuda"
+    )
+    engine = LLMEngine(paged_runner, max_batch_size=len(real_prompts), block_manager=block_manager)
+    seqs = [
+        Sequence(tokenizer.encode(p), SamplingParams(temperature=0.0, max_tokens=max_new_tokens))
+        for p in real_prompts
+    ]
+    for seq in seqs:
+        engine.add_request(seq)
+    engine.run_until_done()
+
+    for i, prompt in enumerate(real_prompts):
+        actual = seqs[i].output_token_ids
+        assert actual == expected[i], (
+            f"Real-model paged/HF mismatch on {prompt!r}\n"
+            f"  HF:    {expected[i]} ({tokenizer.decode(expected[i])!r})\n"
+            f"  paged: {actual} ({tokenizer.decode(actual)!r})"
+        )
