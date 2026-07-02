@@ -127,11 +127,44 @@ def test_batched_sequences_match_single(runner, hf_model):
         )
 
 
-@pytest.mark.skip(reason="Milestone 3 — not yet implemented")
-def test_continuous_batch_matches_single():
+def test_continuous_batch_matches_single(runner, hf_model):
     """
-    Sequences processed via the continuous batching scheduler produce
-    identical tokens to single-sequence baseline — regardless of when
-    they were admitted or preempted.
+    Every sequence driven through the continuous batching engine produces
+    identical tokens to the single-sequence HuggingFace baseline.
+
+    Why this matters: M3 stores and restores per-sequence KV caches and
+    admits sequences at different times. A bug in _to_tuple_kv / _slice_kv
+    or in the decode_one position encoding would cause divergence here.
+
+    max_batch_size=2 with 4 prompts means the engine will admit the first 2,
+    then as each finishes, admit the next — exercising the continuous admit
+    path (not just static batching with a scheduler veneer).
     """
-    ...
+    from mini_vllm.engine.llm_engine import LLMEngine
+
+    model, tokenizer = hf_model
+
+    # Build the sequences to run through our engine.
+    engine_seqs = [
+        Sequence(
+            tokenizer.encode(p),
+            SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS),
+        )
+        for p in FIXED_PROMPTS
+    ]
+
+    engine = LLMEngine(runner, max_batch_size=2)
+    for seq in engine_seqs:
+        engine.add_request(seq)
+    engine.run_until_done()
+
+    # Compare every engine output against HuggingFace greedy baseline.
+    for seq, prompt in zip(engine_seqs, FIXED_PROMPTS):
+        expected = _hf_generate(model, tokenizer, prompt, MAX_NEW_TOKENS)
+        assert seq.output_token_ids == expected, (
+            f"M3 engine mismatch on {prompt!r}\n"
+            f"  HF:     {expected}\n"
+            f"  engine: {seq.output_token_ids}\n"
+            f"  HF decoded:     {tokenizer.decode(expected)!r}\n"
+            f"  engine decoded: {tokenizer.decode(seq.output_token_ids)!r}"
+        )
