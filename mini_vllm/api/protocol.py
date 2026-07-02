@@ -32,4 +32,5 @@ class CompletionChunk(BaseModel):
     """SSE streaming chunk."""
     id: str
     object: Literal["text_completion"] = "text_completion"
+    model: str
     choices: list[CompletionChoice]
