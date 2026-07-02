@@ -67,7 +67,9 @@ def test_completions_non_streaming_matches_hf_baseline(client):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=getattr(torch, DTYPE))
+    # torch_dtype= (not dtype=) — matches mini_vllm/model/loader.py's own
+    # handling of the transformers 4.46.3 (Kaggle-pinned) vs 5.x API split.
+    model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=getattr(torch, DTYPE))
     model = model.to(DEVICE)
     model.eval()
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(DEVICE)
