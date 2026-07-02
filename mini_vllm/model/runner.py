@@ -6,18 +6,24 @@ Milestone 1/2: generate() — batched prefill→decode for a fixed group of
 
 Milestone 3: prefill_and_store() + decode_one() + free_seq() — per-sequence
   KV cache storage that the continuous-batching engine loop drives.
-  decode_one() runs one forward pass per sequence (O(N) passes per step).
-  That is intentionally simple: M4 replaces it with a single batched pass
-  via paged attention, making it O(1) passes regardless of batch size.
 
-Milestone 4+: the Scheduler replaces generate(); prefill/decode stay.
+Position IDs note (why we pass them explicitly):
+  GPT-2 and other models with absolute position embeddings do not compute
+  position_ids from attention_mask on their own. For a left-padded batch,
+  token at input index 6 would get position_id=6 even if it is really the
+  first real token (preceded by 5 padding tokens). That causes wrong outputs.
+  We always pass explicit position_ids so every model type behaves correctly.
 
-KV cache format note:
-  Transformers 4.38+ returns past_key_values as a DynamicCache object.
-  _to_tuple_kv() normalises it to a tuple of (key, value) tensor pairs so
-  the rest of the code can use plain indexing without knowing which version
-  of transformers is installed.  We pass tuple-of-tuples back into the model
-  — transformers 4.38+ accepts both formats on input.
+  Prefill: position_ids = cumsum(attention_mask) - 1, clamped ≥ 0
+    → padding positions get 0 (masked anyway), real tokens get 0,1,2,...
+  Decode:  position_ids = attention_mask.sum(dim=1) before appending new col
+    → equals the count of real tokens so far = correct next position
+
+Cache format note:
+  Transformers 4.38+ returns a DynamicCache object. We slice it using its
+  .key_cache / .value_cache lists (always per-layer tensors). For the rare
+  legacy tuple-of-tuples format we use index access [0][1] not tuple
+  unpacking, so 3-element tuples from some transformers versions don't crash.
 """
 from __future__ import annotations
 
@@ -34,33 +40,34 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# KV cache helpers
+# KV-cache helpers (M3)
 # ---------------------------------------------------------------------------
 
-def _to_tuple_kv(past_kv: Any) -> tuple:
+def _slice_kv(past_kv: Any, i: int) -> Any:
     """
-    Normalise any past_key_values format to a tuple of (key, value) pairs.
+    Extract sequence i from a batched cache. Preserves the cache type so the
+    sliced result can be passed straight back to the model without conversion.
 
-    Transformers 4.38+ may return a DynamicCache object with .key_cache and
-    .value_cache lists. zip() over those always produces 2-tuples, so the
-    rest of the code can use `for k, v in kv` without version guards.
+    DynamicCache (transformers 4.38+): build a new DynamicCache with batch=1
+      by slicing each layer tensor along dim 0.
+    Legacy tuple-of-tuples: use index access [0][1] to avoid the 3-element
+      unpack error that appears with some transformers 5.x DynamicCache iters.
     """
     if hasattr(past_kv, "key_cache") and hasattr(past_kv, "value_cache"):
-        return tuple(zip(past_kv.key_cache, past_kv.value_cache))
-    # Legacy tuple-of-tuples; each element is already (key, value).
-    return tuple(past_kv)
-
-
-def _slice_kv(kv: tuple, i: int) -> tuple:
-    """
-    Extract one sequence (row i) from a batched KV cache tuple.
-
-    kv: tuple of (key, value) pairs, each tensor of shape (B, H, S, D).
-    Returns a tuple of (key, value) pairs with shape (1, H, S, D).
-    """
+        try:
+            from transformers.cache_utils import DynamicCache
+        except ImportError:
+            from transformers import DynamicCache   # older path
+        sliced = DynamicCache()
+        sliced.key_cache   = [k[i : i + 1].contiguous() for k in past_kv.key_cache]
+        sliced.value_cache = [v[i : i + 1].contiguous() for v in past_kv.value_cache]
+        if hasattr(past_kv, "_seen_tokens"):
+            sliced._seen_tokens = past_kv._seen_tokens
+        return sliced
+    # Legacy: each layer is (key, value) or (key, value, extra…) — index-safe
     return tuple(
-        (k[i : i + 1].contiguous(), v[i : i + 1].contiguous())
-        for k, v in kv
+        (layer[0][i : i + 1].contiguous(), layer[1][i : i + 1].contiguous())
+        for layer in past_kv
     )
 
 
@@ -81,13 +88,13 @@ class ModelRunner:
         self.device = torch.device(config.device)
 
         # Per-sequence KV cache storage for M3 (continuous batching).
-        # Key: seq_id  Value: tuple of (key, value) tensor pairs (batch dim = 1)
-        self._kv_cache: dict[int, tuple] = {}
+        # Key: seq_id  Value: DynamicCache or tuple, batch dim = 1
+        self._kv_cache: dict[int, Any] = {}
         # Key: seq_id  Value: attention mask of shape (1, seq_len)
         self._attn_masks: dict[int, torch.Tensor] = {}
 
     # -----------------------------------------------------------------------
-    # Shared forward-pass primitives  (used by both M2 generate and M3 engine)
+    # Shared forward-pass primitives
     # -----------------------------------------------------------------------
 
     def prefill(
@@ -97,11 +104,11 @@ class ModelRunner:
         Batched prefill: left-pad all prompts, one forward pass, return first tokens.
 
         Left-padding ensures logits[:, -1, :] is always the last *real* token
-        for every sequence — no per-sequence index arithmetic needed.
-        The attention mask (0=padding, 1=real) keeps padded positions masked.
+        for every sequence. Explicit position_ids (from cumsum of the mask)
+        fix GPT-2 and other absolute-position models which otherwise assign
+        wrong positions to padded sequences.
 
         Returns (first_token_ids, past_key_values, attention_mask).
-        The caller threads past_key_values and attention_mask into decode().
         """
         pad_id: int = getattr(self.tokenizer, "pad_token_id", None) or 0
         batch = len(sequences)
@@ -121,12 +128,20 @@ class ModelRunner:
             )
             attention_mask[i, offset:] = 1
 
+        # position_ids: real token at mask offset k gets position k-1 (0-indexed).
+        # Padding positions get 0 — they are masked out anyway.
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids = position_ids.clamp(min=0)
+
         with torch.no_grad():
             out = self.model(
-                input_ids, attention_mask=attention_mask, use_cache=True
+                input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=True,
             )
 
-        logits = out.logits[:, -1, :]   # (batch, vocab_size) — last real token
+        logits = out.logits[:, -1, :]   # last real token per row (left-pad guarantee)
 
         tokens = [
             int(Sampler.sample(
@@ -148,9 +163,10 @@ class ModelRunner:
         """
         One decode step over the full batch.
 
-        Extends the attention mask by one real column (new token attends to
-        itself + all real past positions) and feeds one token per sequence.
-        past_kv flows straight through without inspection.
+        position_ids for the new token = count of real tokens so far
+          = attention_mask.sum(dim=1) before we append the new column.
+        This is the correct next position regardless of how many padding
+        tokens exist to the left of the prompt.
 
         Returns (next_token_ids, updated_past_kv, updated_attention_mask).
         """
@@ -159,7 +175,11 @@ class ModelRunner:
             [[s.output_token_ids[-1]] for s in sequences],
             dtype=torch.long,
             device=self.device,
-        )
+        )   # (batch, 1)
+
+        # Position of the token we are about to generate.
+        position_ids = attention_mask.sum(dim=1, keepdim=True)   # (batch, 1)
+
         new_col = torch.ones(batch, 1, dtype=torch.long, device=self.device)
         full_mask = torch.cat([attention_mask, new_col], dim=1)
 
@@ -168,6 +188,7 @@ class ModelRunner:
                 input_ids,
                 past_key_values=past_kv,
                 attention_mask=full_mask,
+                position_ids=position_ids,
                 use_cache=True,
             )
 
@@ -184,16 +205,16 @@ class ModelRunner:
         return tokens, out.past_key_values, full_mask
 
     # -----------------------------------------------------------------------
-    # M2 — static batching  (used by generate(); M1 tests go through here too)
+    # M2 — static batching
     # -----------------------------------------------------------------------
 
     def generate(self, sequences: list[Sequence]) -> list[Sequence]:
         """
-        Prefill → decode until every sequence in the batch finishes.
+        Prefill → decode until every sequence finishes (static batching).
 
-        Static batching: the full batch runs together until the LAST sequence
-        finishes. Sequences that hit EOS earlier stay in the tensor (we stop
-        recording their tokens); the wasted compute is what M3 fixes.
+        All sequences run together as one fixed batch. Sequences that hit EOS
+        early stay in the tensor but their tokens are discarded — the wasted
+        compute is what M3 fixes with continuous batching.
         """
         eos_id = getattr(self.tokenizer, "eos_token_id", None)
         finished = [False] * len(sequences)
@@ -221,44 +242,41 @@ class ModelRunner:
         return sequences
 
     # -----------------------------------------------------------------------
-    # M3 — per-sequence KV cache  (used by LLMEngine)
+    # M3 — per-sequence KV cache
     # -----------------------------------------------------------------------
 
     def prefill_and_store(self, sequences: list[Sequence]) -> list[int]:
         """
         Batched prefill + store per-sequence KV caches.
 
-        After the joint forward pass, slices the batch KV cache into
-        individual tensors stored in self._kv_cache[seq_id].
-
-        Returns the first generated token for each sequence.
+        Slices the batched cache into per-sequence entries (batch dim = 1)
+        using _slice_kv, which preserves the DynamicCache type so the result
+        can be passed straight to the model in decode_one without conversion.
         """
         first_tokens, batch_kv, attn_mask = self.prefill(sequences)
-
-        kv_tuple = _to_tuple_kv(batch_kv)
         for i, seq in enumerate(sequences):
-            self._kv_cache[seq.seq_id] = _slice_kv(kv_tuple, i)
+            self._kv_cache[seq.seq_id]  = _slice_kv(batch_kv, i)
             self._attn_masks[seq.seq_id] = attn_mask[i : i + 1]
-
         return first_tokens
 
     def decode_one(self, seq: Sequence) -> int:
         """
-        Decode a single sequence step using its stored KV cache.
+        Decode one step for a single sequence using its stored KV cache.
 
-        Runs one forward pass for this sequence alone (batch=1). This is
-        O(N) passes per decode step — simple and correct but not optimal.
-        M4 replaces this with a single batched pass via paged attention.
+        Runs one forward pass (batch=1). O(N) passes per decode step — correct
+        but not optimal. M4 replaces this with a single batched paged-attention
+        pass regardless of how many sequences are in flight.
 
-        Updates _kv_cache[seq_id] and _attn_masks[seq_id] in place.
-        Returns the next token id.
+        Stores out.past_key_values directly (no slicing needed since batch=1).
         """
         past_kv = self._kv_cache[seq.seq_id]
-        mask = self._attn_masks[seq.seq_id]
+        mask     = self._attn_masks[seq.seq_id]
 
         input_id = torch.tensor(
             [[seq.output_token_ids[-1]]], dtype=torch.long, device=self.device
         )
+        # Position of the token we are generating = count of real tokens so far.
+        position_ids = mask.sum(dim=1, keepdim=True)   # (1, 1)
         new_mask = torch.cat(
             [mask, torch.ones(1, 1, dtype=torch.long, device=self.device)], dim=1
         )
@@ -268,6 +286,7 @@ class ModelRunner:
                 input_id,
                 past_key_values=past_kv,
                 attention_mask=new_mask,
+                position_ids=position_ids,
                 use_cache=True,
             )
 
@@ -279,9 +298,8 @@ class ModelRunner:
             top_k=seq.sampling_params.top_k,
         ).item())
 
-        # Store updated cache (now one position longer).
-        new_kv = _to_tuple_kv(out.past_key_values)
-        self._kv_cache[seq.seq_id] = _slice_kv(new_kv, 0)
+        # batch=1 → store directly, no slicing required.
+        self._kv_cache[seq.seq_id]  = out.past_key_values
         self._attn_masks[seq.seq_id] = new_mask
 
         return tok
