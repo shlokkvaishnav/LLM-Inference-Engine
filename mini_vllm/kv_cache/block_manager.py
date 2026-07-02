@@ -117,6 +117,29 @@ class BlockManager:
         seq.block_table.append(block.block_id)
         return True
 
+    def has_capacity_for_next_token(self, seq: object) -> bool:
+        """
+        Predictive check the Scheduler runs BEFORE decode: will seq have room
+        for one more token after this step's generation? If the current
+        blocks already cover length+1, returns True with no side effect. If
+        not and a free block exists, reserves it immediately (extends
+        seq.block_table) and returns True — this is safe to call before the
+        token is actually appended, and append_slot() becomes a no-op for
+        that token once length catches up to the now-larger capacity.
+
+        Returns False only when a new block is needed and none are free —
+        the caller (Scheduler) must preempt a running sequence to proceed.
+        """
+        capacity = len(seq.block_table) * self.block_size
+        if seq.length + 1 <= capacity:
+            return True
+        if self.num_free_blocks == 0:
+            return False
+        block = self._free_blocks.pop()
+        block.ref_count = 1
+        seq.block_table.append(block.block_id)
+        return True
+
     def free(self, seq: object) -> None:
         """
         Return all of seq's blocks to the free pool and clear its block_table.

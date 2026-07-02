@@ -1,25 +1,31 @@
 """
-Continuous batching scheduler — Milestone 3.
+Continuous batching scheduler — Milestone 3 (admission) + Milestone 4 (preemption).
 
 The scheduler answers one question every decode step:
   "Given the current WAITING queue and RUNNING batch,
-   which sequences run this step, which are done, and which get freed?"
+   which sequences run this step, which get preempted, and which are done?"
 
-This is the heart of continuous batching. Unlike static batching (which
-assembles a full batch, runs it to completion, then starts the next),
-the scheduler runs every step and can:
-  - Admit a WAITING sequence the moment a running slot opens up
-  - Retire a FINISHED sequence immediately without stalling others
+M3 policy: FCFS admission, no memory accounting — a Scheduler(block_manager=None)
+  behaves exactly like the original M3 scheduler (batch-size gating only).
 
-M3 policy: First-Come-First-Served (FCFS), no memory-pressure preemption.
-  Preemption is added in M4 when we have block-level memory accounting.
+M4 policy: pass a BlockManager and step() also does memory-pressure preemption.
+  Two independent phases, each bounded (no thrashing):
 
-Interview note: the key insight is that step() runs EVERY decode step — it
-is called in a tight loop by the engine, not once per batch. That's what
-makes "continuous" batching continuous.
+  1. Preemption — for every RUNNING sequence (checked LIFO: most-recently
+     admitted first), ask "will it have room for the token it's about to
+     generate?" If not and no free block exists, evict it: mark PREEMPTED,
+     free its blocks, and requeue it at the FRONT of the waiting queue (so
+     it resumes before any newer request — same recompute priority vLLM uses).
+
+  2. Admission — try to admit WAITING sequences (FCFS) up to max_batch_size.
+     Admission NEVER preempts a running sequence to make room. Without this
+     rule, admitting seq B by evicting seq A, then evicting seq B on the next
+     iteration to re-admit seq A, could oscillate forever. If the head of the
+     waiting queue doesn't fit, later waiters are left blocked too (simple
+     head-of-line policy — no queue-jumping in M4).
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from mini_vllm.engine.sequence import Sequence, SequenceStatus
 
@@ -28,25 +34,26 @@ from mini_vllm.engine.sequence import Sequence, SequenceStatus
 class SchedulerOutput:
     """The scheduler's decision for one decode step."""
     scheduled: list[Sequence]   # sequences that run this step (prefill or decode)
-    preempted: list[Sequence]   # evicted due to memory pressure (M4+)
+    preempted: list[Sequence]   # sequences evicted this step due to memory pressure
     finished: list[Sequence]    # completed after the previous step (informational)
 
 
 class Scheduler:
     """
-    FCFS continuous batching scheduler.
-
-    State machines:
-      add_request → WAITING
-      step()      → WAITING sequences promoted to RUNNING (up to max_batch_size)
-      free(seq)   → removes from RUNNING (called by engine after seq finishes)
+    FCFS continuous batching scheduler, with optional M4 memory-pressure preemption.
 
     Invariant: len(self.running) <= max_batch_size at all times.
     """
 
-    def __init__(self, max_batch_size: int, max_waiting: int = 1024) -> None:
+    def __init__(
+        self,
+        max_batch_size: int,
+        max_waiting: int = 1024,
+        block_manager: object | None = None,
+    ) -> None:
         self.max_batch_size = max_batch_size
         self.max_waiting = max_waiting
+        self.block_manager = block_manager   # None = M3 behavior, no memory accounting
         self.waiting: list[Sequence] = []
         self.running: list[Sequence] = []
 
@@ -62,43 +69,76 @@ class Scheduler:
 
     def step(self) -> SchedulerOutput:
         """
-        Decide what runs this step.
-
-        1. Admit WAITING sequences into RUNNING (FCFS) until the batch is full.
-        2. Return the full running batch as `scheduled`.
+        Decide what runs this step: preempt if necessary, then admit.
 
         The engine is responsible for:
           - Distinguishing prefill (num_generated_tokens == 0) from decode.
           - Appending tokens and calling free() when a sequence finishes.
-          - Calling free() on preempted sequences (M4+).
-
-        M4 will add a memory-budget check here and preempt the youngest
-        running sequences when the block pool is exhausted.
         """
-        # Admit as many waiting sequences as the batch has room for.
-        while self.waiting and len(self.running) < self.max_batch_size:
-            seq = self.waiting.pop(0)      # FCFS: take the oldest waiter
-            seq.status = SequenceStatus.RUNNING
-            self.running.append(seq)
+        preempted = self._preempt_if_needed()
+        self._admit_waiting()
 
         return SchedulerOutput(
             scheduled=list(self.running),  # snapshot — engine must not mutate this
-            preempted=[],                  # M4 will populate this
+            preempted=preempted,
             finished=[],                   # engine tracks this; included for completeness
         )
 
+    def _preempt_if_needed(self) -> list[Sequence]:
+        """
+        M4: evict RUNNING sequences (LIFO — most recently admitted first)
+        that won't have room for their next generated token and can't get
+        a new block. No-op when block_manager is None (M3 behavior).
+        """
+        if self.block_manager is None:
+            return []
+
+        preempted: list[Sequence] = []
+        i = len(self.running) - 1
+        while i >= 0:
+            seq = self.running[i]
+            if not self.block_manager.has_capacity_for_next_token(seq):
+                victim = self.running.pop(i)
+                victim.status = SequenceStatus.PREEMPTED
+                self.block_manager.free(victim)
+                self.waiting.insert(0, victim)   # resumes before any newer request
+                preempted.append(victim)
+            i -= 1
+        return preempted
+
+    def _admit_waiting(self) -> None:
+        """
+        Promote WAITING → RUNNING (FCFS) up to max_batch_size. With a
+        block_manager set, a sequence that doesn't currently fit blocks
+        admission entirely (head-of-line blocking) rather than preempting
+        a running sequence to make room.
+        """
+        while self.waiting and len(self.running) < self.max_batch_size:
+            seq = self.waiting[0]
+
+            if self.block_manager is not None:
+                if not self.block_manager.can_allocate(seq):
+                    break   # doesn't fit yet; leave it (and the rest) waiting
+                self.block_manager.allocate(seq)
+
+            self.waiting.pop(0)
+            seq.status = SequenceStatus.RUNNING
+            self.running.append(seq)
+
     def free(self, seq: Sequence) -> None:
         """
-        Remove a sequence from the running batch.
+        Remove a sequence from the running batch and release its blocks.
 
-        Called by the engine when a sequence finishes (FINISHED) or is
-        preempted (PREEMPTED). After free(), the slot is available and the
-        next step() will admit a waiting sequence into it.
+        Called by the engine when a sequence finishes (FINISHED). Idempotent
+        — safe to call even if the sequence was already removed (e.g. by
+        preemption).
         """
         try:
             self.running.remove(seq)
         except ValueError:
-            pass   # already removed (idempotent — safe to call twice)
+            pass
+        if self.block_manager is not None:
+            self.block_manager.free(seq)
 
     def has_work(self) -> bool:
         """False only when both queues are empty — engine loop terminates."""
