@@ -1,33 +1,37 @@
 """
-LLMEngine — the continuous batching loop (Milestone 3).
+LLMEngine — the continuous batching loop (Milestone 3, batched decode in M4).
 
-Wires the Scheduler (who runs?) to the ModelRunner (how?).
+Wires the Scheduler (who runs?) to a runner (how?).
 
 The loop:
 
   while scheduler.has_work():
-      output = scheduler.step()          # decide who runs
+      output = scheduler.step()          # decide who runs (+ preempt, M4)
 
       prefill  newly-admitted seqs       # batched — one GPU pass
-      decode   each already-running seq  # one GPU pass each (M4 batches these)
+      decode   each already-running seq  # batched if the runner supports it
 
       for each finished seq:
           scheduler.free(seq)
           runner.free_seq(seq_id)
 
-Design note — why decode_one instead of batched decode:
-  Continuous batching admits sequences at different times, so their KV caches
-  have different sequence lengths.  Batching them requires padding + a mask
-  that spans heterogeneous lengths, which needs either careful bookkeeping
-  (possible but fiddly) or paged attention (M4).  decode_one keeps M3 simple
-  and correct at the cost of O(N) GPU passes per step.  M4 collapses that to
-  O(1) passes regardless of batch size — which is the real vLLM innovation.
+Two runner protocols, both supported:
+  ModelRunner (M1-M3): decode_one(seq) -> token — one GPU pass PER sequence,
+    O(N) passes/step. Detected by the absence of decode_batch.
+  PagedLlamaRunner (M4): decode_batch(sequences) -> list[token] — ONE GPU
+    pass (per layer) for the WHOLE running batch, O(1) passes/step. This is
+    the actual vLLM-style payoff of paged attention: batch size stops
+    mattering to how many forward passes a decode step costs.
+
+Pass block_manager to enable M4 preemption in the Scheduler (see M4b);
+omit it for plain M3 FCFS-only behavior.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from mini_vllm.engine.scheduler import Scheduler, SchedulerOutput
 from mini_vllm.engine.sequence import Sequence, SequenceStatus
-from mini_vllm.model.runner import ModelRunner
 
 
 class LLMEngine:
@@ -42,9 +46,14 @@ class LLMEngine:
         # seq.output_token_ids now populated for every seq
     """
 
-    def __init__(self, runner: ModelRunner, max_batch_size: int = 8) -> None:
+    def __init__(
+        self,
+        runner: Any,
+        max_batch_size: int = 8,
+        block_manager: Any | None = None,
+    ) -> None:
         self.runner = runner
-        self.scheduler = Scheduler(max_batch_size=max_batch_size)
+        self.scheduler = Scheduler(max_batch_size=max_batch_size, block_manager=block_manager)
 
     def add_request(self, seq: Sequence) -> None:
         self.scheduler.add_request(seq)
@@ -71,10 +80,16 @@ class LLMEngine:
                 seq.append_token(tok)
                 seq.status = SequenceStatus.RUNNING
 
-        # --- Decode (one pass per sequence until M4) ---
-        for seq in to_decode:
-            tok = self.runner.decode_one(seq)
-            seq.append_token(tok)
+        # --- Decode: batched (M4, PagedLlamaRunner) or per-sequence (M3) ---
+        if to_decode:
+            if hasattr(self.runner, "decode_batch"):
+                tokens = self.runner.decode_batch(to_decode)
+                for seq, tok in zip(to_decode, tokens):
+                    seq.append_token(tok)
+            else:
+                for seq in to_decode:
+                    tok = self.runner.decode_one(seq)
+                    seq.append_token(tok)
 
         # --- Retire finished sequences ---
         for seq in list(output.scheduled):
