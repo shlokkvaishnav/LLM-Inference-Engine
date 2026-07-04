@@ -75,6 +75,8 @@ same pool without fragmentation.
 
 ### Correctness (M1–M6, Kaggle T4, TinyLlama-1.1B)
 
+*(M7 adds benchmark scripts, not new correctness tests — see below for its own results)*
+
 Every milestone is verified token-for-token (or, for quantization, within a
 calibrated error bound) against a HuggingFace `transformers` ground truth —
 28/28 tests passing:
@@ -106,17 +108,44 @@ this hardware. A genuine speedup needs a fused low-precision GEMM kernel that
 never materializes the full-precision weight (structurally similar to the
 paged-attention Triton kernel below) — a natural follow-up, not yet built.
 
-### End-to-end throughput vs baselines
+### End-to-end throughput vs baselines (M7, real TinyLlama-1.1B, Kaggle T4)
 
-*(Filled in at Milestone 7 — naive HF `generate()`, static-batched HF, and a
-real vLLM ceiling, all on the same hardware/model/prompts as above)*
+`benchmarks/baseline_hf.py` — 8 prompts, output_len=32:
 
-| System | Throughput (tok/s) | P50 latency (ms) | P95 latency (ms) | Notes |
-|--------|-------------------|-----------------|-----------------|-------|
-| HF `generate()` — naive | — | — | — | single request |
-| HF `generate()` — batched | — | — | — | static batch |
-| **mini-vLLM** | — | — | — | continuous batch + paged KV |
-| vLLM (ceiling) | — | — | — | if available |
+| System | Throughput (tok/s) | Wall-clock (s) | Peak GPU mem | Notes |
+|--------|--------------------|-----------------|--------------|-------|
+| HF `generate()` — naive | 39.2 | 6.53 | 2212 MB | sequential, one prompt at a time |
+| HF `generate()` — batched | 285.8 | 0.90 | 2223 MB | single call, all 8 prompts batched |
+| **mini-vLLM** | 72.6 | 3.52 | 2463 MB | continuous batch + paged KV, `max_batch_size=4` |
+| vLLM (ceiling) | — | — | — | not installed (see script docstring) |
+
+**Why mini-vLLM is slower here — measured, not glossed over:**
+1. **The comparison itself isn't apples-to-apples**: this run used `max_batch_size=4`
+   against 8 prompts, so mini-vLLM only ever processes half the parallelism HF's single
+   `generate()` call uses natively (all 8 at once).
+2. **`PagedLlamaRunner.decode_batch` has real per-step Python overhead**: it manually loops
+   over Llama's 22 layers in Python, and within each layer does a per-sequence Python loop
+   to write K/V into the block pool. HF's `generate()` runs one fused SDPA call per layer
+   with no per-sequence indexing. For a small batch of short sequences, that overhead can
+   outweigh paged attention's O(1)-passes-per-step advantage — the same "measure, don't
+   assume" lesson as M5's quantization speed result.
+
+### Concurrent load test (M7, same model/hardware)
+
+`benchmarks/load_test.py` against the real running server, ramped concurrency:
+
+| Concurrency | P50 TTFT (ms) | P95 TTFT (ms) | P99 TTFT (ms) | Throughput (tok/s) |
+|---|---|---|---|---|
+| 1 | 58 | 58 | 58 | 40.1 |
+| 2 | 105 | 117 | 118 | 64.8 |
+| 4 | 138 | 163 | 167 | 108.4 |
+| 8 | 208 | 240 | 240 | 198.7 |
+| 16 | 768 | 1420 | 1421 | 211.0 |
+
+This is the more representative payoff: throughput keeps climbing through concurrency=16
+while TTFT stays low through concurrency=8 (matching the server's default
+`max_batch_size=8`) before rising — continuous batching earning its keep under *varying
+concurrent load*, a different and more realistic claim than "beats one fixed static batch."
 
 Hardware: Kaggle T4 (16 GB VRAM) · TinyLlama-1.1B · fp16
 
@@ -131,7 +160,7 @@ Hardware: Kaggle T4 (16 GB VRAM) · TinyLlama-1.1B · fp16
 - [x] **M4** Paged KV-cache — BlockManager, LIFO preemption, Triton paged-attention kernel, full engine integration (O(1) batched decode)
 - [x] **M5** Quantization — INT8 + INT4, weight-only, measured quality/speed tradeoff (see Results)
 - [x] **M6** OpenAI-compatible API — `/v1/completions` with SSE streaming, async continuous-batching engine
-- [ ] **M7** Benchmark suite + concurrent load test vs HF/vLLM
+- [x] **M7** Benchmark suite + concurrent load test vs HF/vLLM
 
 ---
 
