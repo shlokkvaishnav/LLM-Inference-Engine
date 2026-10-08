@@ -102,10 +102,14 @@ def test_completions_streaming_matches_non_streaming(client):
                 saw_done = True
                 break
             chunk = json.loads(payload_str)
-            collected += chunk["choices"][0]["text"]
+            if chunk["choices"]:
+                collected += chunk["choices"][0]["text"]
+            else:
+                usage = chunk["usage"]
 
     assert saw_done
     assert collected == expected_text
+    assert usage == non_stream_resp.json()["usage"]
 
 
 @pytest.mark.asyncio
@@ -183,3 +187,76 @@ def test_stop_string_truncates_output(client):
     assert stop not in resp["text"]
     assert resp["finish_reason"] == "stop"
     assert base.startswith(resp["text"])
+
+
+def test_models_endpoint(client):
+    body = client.get("/v1/models").json()
+    assert body["object"] == "list"
+    assert [m["id"] for m in body["data"]] == [MODEL]
+    assert body["data"][0]["object"] == "model"
+
+
+def test_usage_counts_match_tokenizer(client):
+    from transformers import AutoTokenizer
+
+    prompt = "The capital of France is"
+    resp = client.post(
+        "/v1/completions",
+        json={"model": MODEL, "prompt": prompt, "max_tokens": 5, "temperature": 0.0},
+    ).json()
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    prompt_tokens = len(tok.encode(prompt))
+    assert resp["usage"]["prompt_tokens"] == prompt_tokens
+    assert resp["usage"]["completion_tokens"] == 5
+    assert resp["usage"]["total_tokens"] == prompt_tokens + 5
+
+
+def test_batched_prompts_match_solo_runs(client):
+    prompts = ["The capital of France is", "Once upon a time", "def fibonacci(n):"]
+    base = {"model": MODEL, "max_tokens": 6, "temperature": 0.0}
+    solo = [
+        client.post("/v1/completions", json={**base, "prompt": p}).json() for p in prompts
+    ]
+    batched = client.post("/v1/completions", json={**base, "prompt": prompts}).json()
+
+    assert [c["index"] for c in batched["choices"]] == [0, 1, 2]
+    assert [c["text"] for c in batched["choices"]] == [r["choices"][0]["text"] for r in solo]
+    assert batched["usage"]["prompt_tokens"] == sum(r["usage"]["prompt_tokens"] for r in solo)
+    assert batched["usage"]["completion_tokens"] == sum(r["usage"]["completion_tokens"] for r in solo)
+
+
+def test_batched_prompts_streaming_indices(client):
+    prompts = ["The capital of France is", "Once upon a time"]
+    base = {"model": MODEL, "max_tokens": 6, "temperature": 0.0}
+    expected = client.post("/v1/completions", json={**base, "prompt": prompts}).json()
+
+    texts = {0: "", 1: ""}
+    finished = set()
+    usage = None
+    with client.stream("POST", "/v1/completions", json={**base, "prompt": prompts, "stream": True}) as resp:
+        for line in resp.iter_lines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            chunk = json.loads(line[len("data: "):])
+            if not chunk["choices"]:
+                usage = chunk["usage"]
+                continue
+            c = chunk["choices"][0]
+            texts[c["index"]] += c["text"]
+            if c["finish_reason"]:
+                finished.add(c["index"])
+
+    assert finished == {0, 1}
+    assert [texts[0], texts[1]] == [c["text"] for c in expected["choices"]]
+    assert usage == expected["usage"]
+
+
+def test_batched_prompts_reject_whole_request_if_one_is_invalid(client):
+    base = {"model": MODEL, "max_tokens": 4}
+    assert client.post("/v1/completions", json={**base, "prompt": ["ok", ""]}).status_code == 400
+    assert client.post("/v1/completions", json={**base, "prompt": []}).status_code == 400
+    too_long = {**base, "max_tokens": 10_000_000, "prompt": ["ok", "also ok"]}
+    assert client.post("/v1/completions", json=too_long).status_code == 400
+    # nothing was left running
+    engine = server_module.state["engine"]
+    assert not engine.engine.scheduler.has_work()
