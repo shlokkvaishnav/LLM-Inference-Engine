@@ -207,6 +207,12 @@ def main() -> None:
     print(f"model={args.model} device={args.device} num_prompts={len(prompts)} output_len={args.output_len} "
           f"max_batch_size={args.max_batch_size}")
 
+    # Untimed warm-up of the batched paths. The first mini-vLLM run in a fresh process
+    # includes a one-off Triton kernel compile (~12 s on a T4, measured) that is not
+    # steady-state throughput; discarding one run keeps the comparison fair.
+    bench_hf_batched(model, tokenizer, prompts, args.output_len, args.device)
+    bench_mini_vllm(model, tokenizer, prompts, args.output_len, args.device, config, args.max_batch_size)
+
     naive = bench_naive(model, tokenizer, prompts, args.output_len, args.device)
     batched = bench_hf_batched(model, tokenizer, prompts, args.output_len, args.device)
     mini = bench_mini_vllm(model, tokenizer, prompts, args.output_len, args.device, config, args.max_batch_size)

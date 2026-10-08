@@ -75,10 +75,18 @@ def measure_quality(baseline_model, quant_model, tokenizer) -> float:
 def measure_speed(model, tokenizer, config) -> float:
     """Tokens/sec across all prompts, generated via the dense runner."""
     runner = ModelRunner(model, tokenizer, config)
-    seqs = [
-        Sequence(tokenizer.encode(p), SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS))
-        for p in PROMPTS
-    ]
+
+    def make_seqs():
+        return [
+            Sequence(tokenizer.encode(p), SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS))
+            for p in PROMPTS
+        ]
+
+    # Untimed warm-up: the first generate() in a fresh process pays one-off CUDA
+    # initialisation and kernel selection costs that would otherwise be counted
+    # against whichever model is measured first.
+    runner.generate(make_seqs())
+    seqs = make_seqs()
     _sync()
     start = time.perf_counter()
     runner.generate(seqs)
