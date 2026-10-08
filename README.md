@@ -137,15 +137,15 @@ last re-run 8 Oct 2026 on the current code).
 ### Correctness
 
 Decode paths are verified token-for-token (or, for quantization, within a calibrated error
-bound) against a Hugging Face `transformers` ground truth. **38/38 tests pass on the GPU**
-with none skipped (last run: 8 Oct 2026). On CPU the same suite gives 36 passed and 2 skipped;
-the two skipped tests (Triton kernel, real-model paged decode) need CUDA.
+bound) against a Hugging Face `transformers` ground truth. **50/50 tests pass on the GPU**
+with none skipped (last run: 8 Oct 2026). On CPU the same suite gives 39 passed and 11 skipped;
+the skipped tests (Triton kernel, real-model paged decode) need CUDA.
 
 | Suite | Tests | What it proves |
 |---|---|---|
 | Dense runner correctness | 3/3 | single, batched and continuous-batch decode match `model.generate()` exactly |
-| Block manager, scheduler, paged attention (incl. Triton) | 12/12 | block allocation, LIFO preemption under memory pressure, paged attention matches dense attention on scattered blocks |
-| Paged runner (`PagedLlamaRunner`, real model) | 3/3 | full paged decode path matches HF on GPU with real weights |
+| Block manager, scheduler, paged attention (incl. Triton, GQA) | 23/23 | block allocation, LIFO preemption under memory pressure, paged attention (including grouped-query heads and non-power-of-two block tables) matches dense attention on scattered blocks |
+| Paged runner (`PagedLlamaRunner`, real model) | 4/4 | full paged decode path matches HF on GPU with real weights; batched sampling equals per-sequence sampling |
 | Quantization | 6/6 | INT8/INT4 round-trip and model-level error bounds |
 | API server (real model + `PagedLlamaRunner`) | 8/8 | streaming equals non-streaming, concurrent requests match solo runs, bad parameters / oversized / empty prompts rejected, stop strings truncate output |
 | Engine robustness | 6/6 | preemption recompute matches an unconstrained run, abort while waiting, engine-loop failure propagates and recovers, stop strings spanning several tokens |
@@ -158,9 +158,9 @@ shrinks memory but does not speed up compute):
 
 | | Size | Quality (cos-sim vs fp16) | Speed |
 |---|---|---|---|
-| fp16 | 1937.8 MB | 1.0000 (baseline) | 133.2 tok/s |
-| INT8 | 970.5 MB (2x smaller) | 1.0000 | 41.9 tok/s (3.2x slower) |
-| INT4 | 486.0 MB (4x smaller) | 0.9785 | 22.1 tok/s (6.0x slower) |
+| fp16 | 1937.8 MB | 1.0000 (baseline) | 149.7 tok/s |
+| INT8 | 970.5 MB (2x smaller) | 1.0000 | 41.9 tok/s (3.6x slower) |
+| INT4 | 486.0 MB (4x smaller) | 0.9785 | 22.2 tok/s (6.7x slower) |
 
 Size and quality are deterministic. Speed is measured after an untimed warm-up and still varies
 by roughly ±10% between runs (fp16 measured 133–160 tok/s across runs).
@@ -176,32 +176,34 @@ weight, which is not implemented.
 
 | System | Throughput (tok/s) | Wall-clock (s) | Peak GPU mem | Notes |
 |--------|--------------------|-----------------|--------------|-------|
-| HF `generate()` — naive | 36.5 | 7.00 | 2212 MB | sequential, one prompt at a time |
-| HF `generate()` — batched | 266.2 | 0.96 | 2223 MB | single call, all 8 prompts batched |
-| **mini-vLLM** (`max_batch_size=4`) | 122.1 | 2.10 | 2463 MB | continuous batch + paged KV |
-| **mini-vLLM** (`max_batch_size=8`) | 209.8 | 1.22 | 2463 MB | all 8 prompts in the batch, like HF batched |
+| HF `generate()` — naive | 42.1 | 6.09 | 2212 MB | sequential, one prompt at a time |
+| HF `generate()` — batched | 305.7 | 0.84 | 2223 MB | single call, all 8 prompts batched |
+| **mini-vLLM** (`max_batch_size=4`) | 157.0 | 1.63 | 2401 MB | continuous batch + paged KV |
+| **mini-vLLM** (`max_batch_size=8`) | 325.3 | 0.79 | 2405 MB | all 8 prompts in the batch, like HF batched |
 | vLLM | — | — | — | opt-in (`--compare-vllm`), not run |
 
-mini-vLLM beats naive HF by 3.3x–5.8x, and at the same batch size it reaches about 80% of
-batched HF's throughput (209.8 vs 258.7 tok/s in the `max_batch_size=8` run). The `max_batch_size=4`
-row is slower mostly because only half the prompts run at a time.
+With the whole prompt set in one batch (`max_batch_size=8`) mini-vLLM matches batched HF
+(325.3 vs 312.3 tok/s in that run, within run-to-run noise) and is about 7.6x faster than
+naive HF. With `max_batch_size=4` only half the prompts run at a time, so it is slower.
+Absolute numbers shift between Kaggle sessions (the HF baselines moved by about 15% between
+the last two runs), so compare rows within one run, not across runs.
+
+**What changed from the previous run** (same hardware and settings, mini-vLLM at
+`max_batch_size=8`: 209.8 -> 325.3 tok/s, i.e. 0.81x -> 1.04x of batched HF; peak GPU memory
+2463 -> 2405 MB): the decode path no longer expands the whole K/V pool to the query-head count
+for every layer on every step (the attention kernel now maps each query head to its KV head,
+grouped-query style); K/V writes are one indexed assignment per layer instead of a
+per-sequence loop; the batch is sampled with a single device sync; and the Triton kernel's
+compile-time block count is rounded up to a power of two to bound recompiles. These changes
+were applied together, so the individual contribution of each has not been measured.
 
 **Warm-up matters.** The first mini-vLLM run in a fresh process is far slower than the rest:
 in a repeated-run experiment on the same T4 it took 14.0 s (18 tok/s), then 1.8 s (about
 140 tok/s) three times in a row. The benchmark scripts therefore run one untimed warm-up first.
 We have not isolated what the first run pays for; a Triton kernel compile is the likely part.
 
-Why mini-vLLM trails batched HF even when warm — hypotheses from reading the code, not
-profiled results:
-1. **Per-step Python overhead**: `PagedLlamaRunner.decode_batch` loops over Llama's 22 layers
-   in Python and, within each layer, loops over sequences to write K/V into the block pool.
-   HF's `generate()` runs one fused attention call per layer.
-2. **GQA expansion over the whole pool**: TinyLlama has 4 KV heads and 32 query heads, and the
-   runner `repeat_interleave`s the *entire* K/V pool (not just the blocks in use) up to 32
-   heads for every layer on every step (`paged_llama_runner.py`, `_paged_decode_layer`).
-3. **A GPU sync per sequence**: sampling calls `.item()` on each sequence's token.
-4. **Possible Triton recompiles**: the kernel takes `MAX_NUM_BLOCKS` as a `constexpr`, so it
-   may recompile each time the longest sequence crosses a block boundary.
+Remaining known overhead (not profiled): `PagedLlamaRunner.decode_batch` still loops over
+Llama's 22 layers in Python, and prefill still runs through the dense Hugging Face forward.
 
 ### Concurrent load test
 
@@ -209,11 +211,11 @@ profiled results:
 
 | Concurrency | P50 TTFT (ms) | P95 TTFT (ms) | P99 TTFT (ms) | Throughput (tok/s) |
 |---|---|---|---|---|
-| 1 | 40 | 40 | 40 | 33.5 |
-| 2 | 77 | 77 | 77 | 58.7 |
-| 4 | 135 | 137 | 137 | 104.5 |
-| 8 | 206 | 207 | 207 | 171.0 |
-| 16 | 887 | 1708 | 1709 | 177.3 |
+| 1 | 32 | 32 | 32 | 39.2 |
+| 2 | 61 | 86 | 88 | 68.1 |
+| 4 | 142 | 143 | 143 | 133.4 |
+| 8 | 130 | 132 | 132 | 260.9 |
+| 16 | 658 | 1247 | 1247 | 242.5 |
 
 Throughput climbs up to concurrency 8 (the server's default `max_batch_size`) and then
 plateaus, while time-to-first-token stays low up to 8 and rises sharply at 16 as requests

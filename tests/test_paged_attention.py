@@ -116,6 +116,56 @@ def test_paged_attention_single_token_context():
     assert torch.allclose(output[0], expected, atol=1e-6)
 
 
+def test_paged_attention_grouped_query_matches_per_head_dense_reference():
+    """
+    Grouped-query attention: 8 query heads share 2 KV heads (group of 4).
+    The cache holds only the 2 KV heads and is never expanded; query head h
+    must attend over KV head h // 4. Compare against dense attention computed
+    head by head from the contiguous K/V.
+    """
+    torch.manual_seed(3)
+    num_heads, num_kv_heads, head_dim, block_size = 8, 2, 8, 4
+    group = num_heads // num_kv_heads
+    scale = head_dim ** -0.5
+
+    seq_lens = [5, 10]
+    num_blocks = 9
+    key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim)
+    value_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim)
+    block_tables_list = [[6, 1], [8, 3, 0]]
+    block_tables = torch.zeros(2, 3, dtype=torch.long)
+    for i, bt in enumerate(block_tables_list):
+        block_tables[i, : len(bt)] = torch.tensor(bt)
+    context_lens = torch.tensor(seq_lens)
+    query = torch.randn(2, num_heads, head_dim)
+
+    output = paged_attention_reference(
+        query, key_cache, value_cache, block_tables, context_lens, scale
+    )
+
+    for s_idx, seq_len in enumerate(seq_lens):
+        ids = block_tables_list[s_idx]
+        keys = torch.cat([key_cache[b] for b in ids], dim=0)[:seq_len]      # (T, Hkv, D)
+        values = torch.cat([value_cache[b] for b in ids], dim=0)[:seq_len]
+        for h in range(num_heads):
+            kv = h // group
+            expected = _dense_attention_reference(
+                query[s_idx, h : h + 1], keys[:, kv : kv + 1], values[:, kv : kv + 1], scale
+            )
+            assert torch.allclose(output[s_idx, h], expected[0], atol=1e-6), (
+                f"seq {s_idx} head {h} should read KV head {kv}"
+            )
+
+
+def test_paged_attention_rejects_incompatible_head_counts():
+    key_cache = torch.randn(2, 4, 3, 8)                  # 3 KV heads
+    query = torch.randn(1, 8, 8)                         # 8 is not a multiple of 3
+    with pytest.raises(AssertionError):
+        paged_attention_reference(
+            query, key_cache, key_cache, torch.tensor([[0]]), torch.tensor([2]), 1.0
+        )
+
+
 @pytest.mark.skipif(
     not (_HAS_TRITON and torch.cuda.is_available()),
     reason="Triton paged attention requires a CUDA GPU (verified on Kaggle)",
@@ -153,3 +203,33 @@ def test_paged_attention_triton_matches_reference():
     assert torch.allclose(ref, triton_out, atol=1e-2, rtol=1e-2), (
         f"max diff: {(ref - triton_out).abs().max().item()}"
     )
+
+
+@pytest.mark.skipif(
+    not (_HAS_TRITON and torch.cuda.is_available()),
+    reason="Triton paged attention requires a CUDA GPU (verified on Kaggle)",
+)
+@pytest.mark.parametrize("num_heads,num_kv_heads", [(8, 2), (32, 4), (4, 1)])
+@pytest.mark.parametrize("max_ctx_blocks", [1, 3, 5])   # 3 and 5 are padded up to 4 and 8 inside the wrapper
+def test_paged_attention_triton_grouped_query_matches_reference(num_heads, num_kv_heads, max_ctx_blocks):
+    """GPU-only: GQA kernel (no cache expansion) matches the reference, including
+    when the block table width is not a power of two."""
+    from mini_vllm.kv_cache.paged_attention import paged_attention_triton
+
+    torch.manual_seed(4)
+    head_dim, block_size, device = 64, 16, "cuda"
+    scale = head_dim ** -0.5
+    num_seqs, num_blocks = 6, 48
+    key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim, device=device)
+    value_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim, device=device)
+
+    context_lens = torch.randint(1, block_size * max_ctx_blocks + 1, (num_seqs,), device=device)
+    context_lens[0] = block_size * max_ctx_blocks            # at least one sequence uses the full width
+    block_tables = torch.stack([
+        torch.randperm(num_blocks, device=device)[:max_ctx_blocks] for _ in range(num_seqs)
+    ])
+    query = torch.randn(num_seqs, num_heads, head_dim, device=device)
+
+    ref = paged_attention_reference(query, key_cache, value_cache, block_tables, context_lens, scale)
+    out = paged_attention_triton(query, key_cache, value_cache, block_tables, context_lens, scale)
+    assert torch.allclose(ref, out, atol=1e-2, rtol=1e-2), f"max diff: {(ref - out).abs().max().item()}"

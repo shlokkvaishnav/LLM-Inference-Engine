@@ -25,8 +25,11 @@ Two implementations, same contract:
 
 Shapes (fixed contract for both implementations):
   query:        (num_seqs, num_heads, head_dim)      — one query per sequence
-  key_cache:    (num_blocks, block_size, num_heads, head_dim)
-  value_cache:  (num_blocks, block_size, num_heads, head_dim)
+  key_cache:    (num_blocks, block_size, num_kv_heads, head_dim)
+  value_cache:  (num_blocks, block_size, num_kv_heads, head_dim)
+                num_heads must be a multiple of num_kv_heads (grouped-query
+                attention). Query head h reads KV head h // (num_heads // num_kv_heads);
+                the cache is never expanded to num_heads.
   block_tables: (num_seqs, max_blocks_per_seq) int64  — physical block IDs,
                 logical order; entries past a sequence's real block count
                 are unused (never read, since context_lens bounds the loop)
@@ -69,7 +72,9 @@ def paged_attention_reference(
     CPU fallback; not the fast path (see paged_attention_triton for that).
     """
     num_seqs, num_heads, head_dim = query.shape
-    block_size = key_cache.shape[1]
+    block_size, num_kv_heads = key_cache.shape[1], key_cache.shape[2]
+    assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads"
+    group = num_heads // num_kv_heads
     output = torch.empty_like(query)
 
     for s in range(num_seqs):
@@ -82,8 +87,12 @@ def paged_attention_reference(
 
         # Flatten blocks into one sequence dimension, then trim padding
         # slots in the (partially filled) last block.
-        keys = k_blocks.reshape(-1, num_heads, head_dim)[:ctx_len]     # (ctx_len, H, D)
-        values = v_blocks.reshape(-1, num_heads, head_dim)[:ctx_len]
+        keys = k_blocks.reshape(-1, num_kv_heads, head_dim)[:ctx_len]     # (ctx_len, Hkv, D)
+        values = v_blocks.reshape(-1, num_kv_heads, head_dim)[:ctx_len]
+        if group > 1:
+            # Expand only this sequence's gathered K/V, never the whole pool.
+            keys = keys.repeat_interleave(group, dim=1)                   # (ctx_len, H, D)
+            values = values.repeat_interleave(group, dim=1)
 
         q = query[s]                                                # (H, D)
         scores = torch.einsum("hd,thd->ht", q, keys) * scale        # (H, ctx_len)
@@ -110,6 +119,7 @@ if _HAS_TRITON:
         BLOCK_SIZE: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         MAX_NUM_BLOCKS: tl.constexpr,
+        GROUP: tl.constexpr,
     ):
         """
         One program instance per (sequence, head). Walks that sequence's
@@ -120,6 +130,7 @@ if _HAS_TRITON:
         """
         seq_idx = tl.program_id(0)
         head_idx = tl.program_id(1)
+        kv_head_idx = head_idx // GROUP    # grouped-query attention: GROUP query heads share a KV head
 
         context_len = tl.load(context_lens_ptr + seq_idx)
 
@@ -146,7 +157,7 @@ if _HAS_TRITON:
                 v_base = v_cache_ptr + physical_block * stride_kv_block
                 kv_offsets = (
                     slot_offsets[:, None] * stride_kv_slot
-                    + head_idx * stride_kv_head
+                    + kv_head_idx * stride_kv_head
                     + dim_offsets[None, :] * stride_kv_dim
                 )
 
@@ -182,11 +193,18 @@ if _HAS_TRITON:
         GPU-only fused paged attention. HEAD_DIM and BLOCK_SIZE must be
         powers of 2 (tl.arange requirement). Falls back is the caller's
         responsibility — call paged_attention_reference on CPU.
+
+        MAX_NUM_BLOCKS is a compile-time constant, so it is rounded up to the
+        next power of two: a growing context then reuses a small, bounded set
+        of compiled kernels instead of recompiling whenever the longest
+        sequence crosses a block boundary. The extra iterations are skipped by
+        the `b < num_blocks` guard and never read the block table.
         """
         assert query.is_cuda, "paged_attention_triton requires CUDA tensors"
         num_seqs, num_heads, head_dim = query.shape
-        block_size = key_cache.shape[1]
-        max_num_blocks = block_tables.shape[1]
+        block_size, num_kv_heads = key_cache.shape[1], key_cache.shape[2]
+        assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads"
+        max_num_blocks = triton.next_power_of_2(block_tables.shape[1])
 
         output = torch.empty_like(query)
         grid = (num_seqs, num_heads)
@@ -201,6 +219,7 @@ if _HAS_TRITON:
             BLOCK_SIZE=block_size,
             HEAD_DIM=head_dim,
             MAX_NUM_BLOCKS=max_num_blocks,
+            GROUP=num_heads // num_kv_heads,
         )
         return output
 

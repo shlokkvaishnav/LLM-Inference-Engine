@@ -13,9 +13,9 @@ implementation is a provably faithful reimplementation of the same
 architecture's forward pass — this is the strongest test available without
 downloading TinyLlama's real weights.
 
-num_key_value_heads < num_attention_heads exercises the GQA head-expansion
-path in PagedLlamaRunner (most real Llama models, including TinyLlama, use
-GQA — a bug there wouldn't be caught by an MHA-only config).
+num_key_value_heads < num_attention_heads exercises the grouped-query
+attention path in PagedLlamaRunner (most real Llama models, including
+TinyLlama, use GQA — a bug there wouldn't be caught by an MHA-only config).
 
 test_paged_llama_matches_hf_on_real_model (bottom of this file) runs the
 same comparison against the real TinyLlama-1.1B weights on GPU — gated on
@@ -136,6 +136,32 @@ def test_paged_llama_releases_blocks_on_finish(tiny_model):
     engine.run_until_done()
 
     assert block_manager.num_free_blocks == block_manager.num_blocks
+
+
+def test_sample_batch_matches_per_sequence_sampling(tiny_model):
+    """The single-sync batched sampler must pick exactly the tokens that
+    per-sequence sampling would, for greedy, all-sampled and mixed batches."""
+    tokenizer = _TinyTokenizer(pad_token_id=0, eos_token_id=99)
+    runner = PagedLlamaRunner(
+        tiny_model, tokenizer, BlockManager(num_blocks=8, block_size=4),
+        dtype=torch.float32, device="cpu",
+    )
+
+    def make(temp, top_k=-1, top_p=1.0):
+        return Sequence([1, 2], SamplingParams(temperature=temp, top_k=top_k, top_p=top_p, max_tokens=4))
+
+    torch.manual_seed(7)
+    logits = torch.randn(4, 100)
+    batches = [
+        [make(0.0), make(0.0), make(0.0), make(0.0)],                       # all greedy: vectorised argmax
+        [make(1.0), make(0.8, top_k=5), make(1.0, top_p=0.9), make(0.5)],   # all sampled
+        [make(0.0), make(1.0), make(0.0), make(0.7, top_k=10)],             # mixed
+    ]
+    for seqs in batches:
+        torch.manual_seed(11)
+        expected = [int(runner._sample(logits[i : i + 1], s).item()) for i, s in enumerate(seqs)]
+        torch.manual_seed(11)
+        assert runner._sample_batch(logits, seqs) == expected
 
 
 @pytest.mark.skipif(
