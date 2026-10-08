@@ -148,3 +148,38 @@ async def test_concurrent_requests_interleave_correctly():
         runner.generate([seq])
         expected = tokenizer.decode(seq.output_token_ids)
         assert texts[i] == expected, f"prompt {i}: concurrent result diverged from solo baseline"
+
+
+def test_rejects_invalid_sampling_params(client):
+    for bad in ({"max_tokens": 0}, {"temperature": -1}, {"top_p": 0}, {"top_p": 1.5}, {"top_k": -5}):
+        resp = client.post("/v1/completions", json={"model": MODEL, "prompt": "Hi", **bad})
+        assert resp.status_code == 422, bad
+
+
+def test_rejects_prompt_that_cannot_fit(client):
+    resp = client.post(
+        "/v1/completions",
+        json={"model": MODEL, "prompt": "Hi", "max_tokens": 10_000_000},
+    )
+    assert resp.status_code == 400
+
+
+def test_rejects_empty_prompt(client):
+    resp = client.post("/v1/completions", json={"model": MODEL, "prompt": "", "max_tokens": 2})
+    assert resp.status_code == 400
+
+
+def test_stop_string_truncates_output(client):
+    base = client.post(
+        "/v1/completions",
+        json={"model": MODEL, "prompt": "The capital of France is", "max_tokens": 12, "temperature": 0.0},
+    ).json()["choices"][0]["text"]
+    stop = base[5:8]
+    resp = client.post(
+        "/v1/completions",
+        json={"model": MODEL, "prompt": "The capital of France is", "max_tokens": 12,
+              "temperature": 0.0, "stop": stop},
+    ).json()["choices"][0]
+    assert stop not in resp["text"]
+    assert resp["finish_reason"] == "stop"
+    assert base.startswith(resp["text"])

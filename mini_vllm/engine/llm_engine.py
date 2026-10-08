@@ -68,6 +68,12 @@ class LLMEngine:
         eos_id = getattr(self.runner.tokenizer, "eos_token_id", None)
         output = self.scheduler.step()
 
+        # Preempted sequences lost their KV blocks: fold their generated
+        # tokens into the prompt so they re-prefill (recompute) on re-admission
+        # instead of decoding against uninitialised blocks.
+        for victim in output.preempted:
+            victim.reset_for_recompute()
+
         # Newly admitted sequences (no generated tokens yet) need prefill.
         to_prefill = [s for s in output.scheduled if s.num_generated_tokens == 0]
         # Sequences already in flight need one more decode step.
@@ -93,16 +99,31 @@ class LLMEngine:
 
         # --- Retire finished sequences ---
         for seq in list(output.scheduled):
-            if seq.check_stop() or (
-                eos_id is not None
-                and seq.output_token_ids
-                and seq.output_token_ids[-1] == eos_id
-            ):
+            if self._should_finish(seq, eos_id):
                 seq.status = SequenceStatus.FINISHED
                 self.scheduler.free(seq)
                 self.runner.free_seq(seq.seq_id)
 
         return output
+
+    def _should_finish(self, seq: Sequence, eos_id: int | None) -> bool:
+        """Check EOS, stop strings, stop ids and max_tokens; sets seq.finish_reason."""
+        if (
+            eos_id is not None
+            and seq.output_token_ids
+            and seq.output_token_ids[-1] == eos_id
+        ):
+            seq.finish_reason = "stop"
+            return True
+        stops = seq.sampling_params.stop_strings
+        if stops:
+            text = self.runner.tokenizer.decode(
+                seq.generated_token_ids, skip_special_tokens=True
+            )
+            if any(st in text for st in stops):
+                seq.finish_reason = "stop"
+                return True
+        return seq.check_stop()
 
     def run_until_done(self) -> None:
         """Drive step() until every sequence finishes."""

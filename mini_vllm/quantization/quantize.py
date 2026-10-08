@@ -71,7 +71,7 @@ def quantize_int4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, tup
     q_unsigned = (q + 8).to(torch.uint8)                            # [1, 15] — fits a nibble
 
     if in_features % 2 != 0:
-        pad = torch.full((out_features, 1), 8, dtype=torch.uint8)   # bias(8) == dequantizes to 0
+        pad = torch.full((out_features, 1), 8, dtype=torch.uint8, device=q_unsigned.device)   # bias(8) == dequantizes to 0
         q_unsigned = torch.cat([q_unsigned, pad], dim=1)
 
     lo = q_unsigned[:, 0::2]

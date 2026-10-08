@@ -30,6 +30,10 @@ from dataclasses import dataclass
 from mini_vllm.engine.sequence import Sequence, SequenceStatus
 
 
+class QueueFullError(RuntimeError):
+    """The waiting queue is at max_waiting; the caller should apply back-pressure."""
+
+
 @dataclass
 class SchedulerOutput:
     """The scheduler's decision for one decode step."""
@@ -60,7 +64,7 @@ class Scheduler:
     def add_request(self, seq: Sequence) -> None:
         """Enqueue a new sequence. Called before the engine loop starts."""
         if len(self.waiting) >= self.max_waiting:
-            raise RuntimeError(
+            raise QueueFullError(
                 f"Waiting queue full ({self.max_waiting}). "
                 "Raise max_waiting or apply back-pressure upstream."
             )
@@ -127,16 +131,17 @@ class Scheduler:
 
     def free(self, seq: Sequence) -> None:
         """
-        Remove a sequence from the running batch and release its blocks.
+        Remove a sequence from the running AND waiting queues and release its blocks.
 
-        Called by the engine when a sequence finishes (FINISHED). Idempotent
-        — safe to call even if the sequence was already removed (e.g. by
-        preemption).
+        Called by the engine when a sequence finishes, and on abort (which
+        may hit a sequence that is still waiting or was preempted).
+        Idempotent.
         """
-        try:
-            self.running.remove(seq)
-        except ValueError:
-            pass
+        for queue in (self.running, self.waiting):
+            try:
+                queue.remove(seq)
+            except ValueError:
+                pass
         if self.block_manager is not None:
             self.block_manager.free(seq)
 

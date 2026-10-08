@@ -18,6 +18,7 @@ class SamplingParams:
     top_k: int = -1          # -1 = disabled
     max_tokens: int = 256
     stop_token_ids: list[int] = field(default_factory=list)
+    stop_strings: list[str] = field(default_factory=list)
 
 
 class Sequence:
@@ -41,9 +42,11 @@ class Sequence:
             Sequence._id_counter += 1
         self.seq_id = seq_id
         self.prompt_token_ids: list[int] = list(prompt_token_ids)
+        self.original_prompt_length = len(self.prompt_token_ids)
         self.output_token_ids: list[int] = []
         self.sampling_params = sampling_params
         self.status = SequenceStatus.WAITING
+        self.finish_reason: str | None = None   # "stop" | "length", set when finished
         # Populated by BlockManager in Milestone 4.
         # Each entry is a physical block ID in the KV-cache pool.
         self.block_table: list[int] = []
@@ -68,8 +71,27 @@ class Sequence:
     def num_generated_tokens(self) -> int:
         return len(self.output_token_ids)
 
+    @property
+    def generated_token_ids(self) -> list[int]:
+        """Every token generated so far, including any folded into the prompt by preemption."""
+        return self.all_token_ids[self.original_prompt_length:]
+
+    @property
+    def num_total_generated(self) -> int:
+        return self.length - self.original_prompt_length
+
     def append_token(self, token_id: int) -> None:
         self.output_token_ids.append(token_id)
+
+    def reset_for_recompute(self) -> None:
+        """
+        Preemption recompute: the KV cache is gone, so fold the generated
+        tokens into the prompt. The sequence then looks like a fresh request
+        with a longer prompt, and the next prefill rebuilds its KV and
+        samples the next token. `length` is unchanged.
+        """
+        self.prompt_token_ids = self.prompt_token_ids + self.output_token_ids
+        self.output_token_ids = []
 
     # ------------------------------------------------------------------
     # Status helpers
@@ -84,8 +106,10 @@ class Sequence:
             return False
         last = self.output_token_ids[-1]
         if last in self.sampling_params.stop_token_ids:
+            self.finish_reason = "stop"
             return True
-        if self.num_generated_tokens >= self.sampling_params.max_tokens:
+        if self.num_total_generated >= self.sampling_params.max_tokens:
+            self.finish_reason = "length"
             return True
         return False
 

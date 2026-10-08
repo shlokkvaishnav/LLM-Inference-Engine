@@ -7,8 +7,8 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - MODEL_NAME=${MODEL_NAME:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}
-      - DEVICE=cuda
+      - MINI_VLLM_MODEL=${MODEL_NAME:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}
+      - MINI_VLLM_DEVICE=cuda
     volumes:
       # Mount HuggingFace cache so weights survive container restarts
       - hf_cache:/root/.cache/huggingface
@@ -28,8 +28,8 @@ services:
     ports:
       - "8001:8000"
     environment:
-      - MODEL_NAME=${MODEL_NAME:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}
-      - DEVICE=cpu
+      - MINI_VLLM_MODEL=${MODEL_NAME:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}
+      - MINI_VLLM_DEVICE=cpu
     volumes:
       - hf_cache:/root/.cache/huggingface
 

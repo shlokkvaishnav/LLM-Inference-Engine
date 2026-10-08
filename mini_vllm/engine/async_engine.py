@@ -53,7 +53,11 @@ class AsyncLLMEngine:
                 await self._new_work.wait()
                 continue
 
-            output = self.engine.step()
+            try:
+                output = self.engine.step()
+            except Exception as exc:   # noqa: BLE001 — must not kill the loop silently
+                self._fail_all(exc)
+                continue
 
             # Every sequence in output.scheduled generated exactly one new
             # token this step, whether via prefill or decode (see
@@ -71,6 +75,31 @@ class AsyncLLMEngine:
             # queue consumers) get a turn between steps.
             await asyncio.sleep(0)
 
+    def _fail_all(self, exc: Exception) -> None:
+        """
+        engine.step() raised: the batch state is unknown, so drop every
+        sequence and deliver the exception to each waiting stream rather
+        than leaving them blocked on queue.get() forever.
+        """
+        scheduler = self.engine.scheduler
+        for seq in list(scheduler.running) + list(scheduler.waiting):
+            scheduler.free(seq)
+            self.engine.runner.free_seq(seq.seq_id)
+            queue = self._queues.get(seq.seq_id)
+            if queue is not None:
+                queue.put_nowait(exc)
+
+    def submit(self, seq: Sequence) -> None:
+        """
+        Enqueue a sequence synchronously. Raises QueueFullError if the
+        waiting queue is full, before any state is registered, so callers
+        can turn it into a 503 before starting a streaming response.
+        """
+        self.engine.add_request(seq)
+        self._queues[seq.seq_id] = asyncio.Queue()
+        self._new_work.set()
+        self.start()
+
     async def generate(self, seq: Sequence) -> AsyncIterator[int]:
         """
         Submit a sequence and yield its token ids as they're generated,
@@ -82,17 +111,17 @@ class AsyncLLMEngine:
         client doesn't leave a zombie sequence permanently occupying a
         batch slot.
         """
-        queue: asyncio.Queue = asyncio.Queue()
-        self._queues[seq.seq_id] = queue
-        self.engine.add_request(seq)
-        self._new_work.set()
-        self.start()
+        if seq.seq_id not in self._queues:
+            self.submit(seq)
+        queue = self._queues[seq.seq_id]
 
         try:
             while True:
                 tok = await queue.get()
                 if tok is None:
                     break
+                if isinstance(tok, Exception):
+                    raise tok
                 yield tok
         finally:
             self._abort(seq)
