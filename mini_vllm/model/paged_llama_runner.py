@@ -169,21 +169,27 @@ class PagedLlamaRunner:
         for seq in sequences:
             self.block_manager.allocate(seq)
 
+        # Destination (block, slot) of every real prompt token, across the whole
+        # batch, so each layer's K/V is written with a single indexed assignment.
+        block_size = self.block_manager.block_size
+        blocks, slots = [], []
+        for seq in sequences:
+            positions = range(len(seq.prompt_token_ids))
+            blocks.extend(seq.block_table[pos // block_size] for pos in positions)
+            slots.extend(pos % block_size for pos in positions)
+        blocks_t = torch.tensor(blocks, dtype=torch.long, device=self.device)
+        slots_t = torch.tensor(slots, dtype=torch.long, device=self.device)
+
         past_kv = out.past_key_values
         for layer_idx in range(self.num_layers):
             k_layer, v_layer = self._layer_kv(past_kv, layer_idx)   # (batch, num_kv_heads, max_len, head_dim)
-            for i, seq in enumerate(sequences):
-                offset = offsets[i]
-                # Real tokens only — skip the left-padding prefix.
-                k_real = k_layer[i, :, offset:, :].transpose(0, 1)   # (prompt_len, num_kv_heads, head_dim)
-                v_real = v_layer[i, :, offset:, :].transpose(0, 1)
-                self._write_tokens(layer_idx, seq, start=0, k=k_real, v=v_real)
+            # Real tokens only — skip each sequence's left-padding prefix.
+            k_real = torch.cat([k_layer[i, :, offsets[i]:, :].transpose(0, 1) for i in range(batch)])
+            v_real = torch.cat([v_layer[i, :, offsets[i]:, :].transpose(0, 1) for i in range(batch)])
+            self.key_pool[layer_idx][blocks_t, slots_t] = k_real     # (total_tokens, num_kv_heads, head_dim)
+            self.value_pool[layer_idx][blocks_t, slots_t] = v_real
 
-        logits = out.logits[:, -1, :]
-        return [
-            int(self._sample(logits[i : i + 1], seq).item())
-            for i, seq in enumerate(sequences)
-        ]
+        return self._sample_batch(out.logits[:, -1, :], sequences)
 
     @staticmethod
     def _layer_kv(past_kv: Any, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -194,19 +200,6 @@ class PagedLlamaRunner:
         if hasattr(past_kv, "key_cache"):
             return past_kv.key_cache[layer_idx], past_kv.value_cache[layer_idx]
         return past_kv[layer_idx][0], past_kv[layer_idx][1]
-
-    def _write_tokens(
-        self, layer_idx: int, seq: Sequence, start: int, k: torch.Tensor, v: torch.Tensor
-    ) -> None:
-        """Write k/v (num_tokens, num_kv_heads, head_dim) into the pool, one
-        token at a time, starting at 0-indexed logical position `start`."""
-        block_size = self.block_manager.block_size
-        for t in range(k.shape[0]):
-            pos = start + t
-            physical_block = seq.block_table[pos // block_size]
-            slot = pos % block_size
-            self.key_pool[layer_idx][physical_block, slot] = k[t]
-            self.value_pool[layer_idx][physical_block, slot] = v[t]
 
     # -----------------------------------------------------------------------
     # Decode — batched paged attention. ONE forward pass (per layer) for the
@@ -235,18 +228,28 @@ class PagedLlamaRunner:
 
         block_tables, context_lens = self._build_block_tables(sequences)
 
+        # Where each sequence's new K/V lands: its last position (see module
+        # docstring). Computed once per step, shared by every layer.
+        block_size = self.block_manager.block_size
+        last_pos = [s.length - 1 for s in sequences]
+        write_blocks = torch.tensor(
+            [s.block_table[p // block_size] for s, p in zip(sequences, last_pos)],
+            dtype=torch.long, device=self.device,
+        )
+        write_slots = torch.tensor(
+            [p % block_size for p in last_pos], dtype=torch.long, device=self.device
+        )
+
         for layer_idx, layer in enumerate(self.model.model.layers):
             x = self._paged_decode_layer(
-                layer, layer_idx, x, cos, sin, block_tables, context_lens, sequences
+                layer, layer_idx, x, cos, sin, block_tables, context_lens,
+                write_blocks, write_slots,
             )
 
         x = self.model.model.norm(x)
         logits = self.model.lm_head(x)[:, -1, :]               # (batch, vocab)
 
-        return [
-            int(self._sample(logits[i : i + 1], seq).item())
-            for i, seq in enumerate(sequences)
-        ]
+        return self._sample_batch(logits, sequences)
 
     def _build_block_tables(self, sequences: list[Sequence]) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -264,7 +267,7 @@ class PagedLlamaRunner:
         return bt, ctx
 
     def _paged_decode_layer(
-        self, layer, layer_idx, x, cos, sin, block_tables, context_lens, sequences
+        self, layer, layer_idx, x, cos, sin, block_tables, context_lens, write_blocks, write_slots
     ) -> torch.Tensor:
         residual = x
         h = layer.input_layernorm(x)
@@ -279,25 +282,14 @@ class PagedLlamaRunner:
         k = k_r.transpose(1, 2).squeeze(1)   # (batch, num_kv_heads, head_dim)
         v = v.squeeze(1)                     # (batch, num_kv_heads, head_dim)
 
-        block_size = self.block_manager.block_size
-        for i, seq in enumerate(sequences):
-            pos = seq.length - 1   # position of the token just fed in — see module docstring
-            physical_block = seq.block_table[pos // block_size]
-            slot = pos % block_size
-            self.key_pool[layer_idx][physical_block, slot] = k[i]
-            self.value_pool[layer_idx][physical_block, slot] = v[i]
+        self.key_pool[layer_idx][write_blocks, write_slots] = k    # (batch, num_kv_heads, head_dim)
+        self.value_pool[layer_idx][write_blocks, write_slots] = v
 
-        if self.num_kv_heads != self.num_q_heads:
-            # GQA: expand cache heads to match query heads for the kernel call.
-            # Memory-inefficient (recomputed every layer/step) — a true
-            # GQA-aware kernel (grouping queries per kv-head internally) is
-            # the natural next optimization, not implemented here.
-            group = self.num_q_heads // self.num_kv_heads
-            key_cache = self.key_pool[layer_idx].repeat_interleave(group, dim=2)
-            value_cache = self.value_pool[layer_idx].repeat_interleave(group, dim=2)
-        else:
-            key_cache = self.key_pool[layer_idx]
-            value_cache = self.value_pool[layer_idx]
+        # The pools hold num_kv_heads heads; the attention functions map each
+        # query head onto its KV head (grouped-query attention) themselves, so
+        # the cache is never expanded.
+        key_cache = self.key_pool[layer_idx]
+        value_cache = self.value_pool[layer_idx]
 
         attn_fn = paged_attention_triton if (self.device.type == "cuda" and _HAS_TRITON) else paged_attention_reference
         attn_out = attn_fn(q, key_cache, value_cache, block_tables, context_lens, self.scale)
@@ -310,6 +302,17 @@ class PagedLlamaRunner:
         h = layer.post_attention_layernorm(x)
         h = layer.mlp(h)
         return residual + h
+
+    def _sample_batch(self, logits: torch.Tensor, sequences: list[Sequence]) -> list[int]:
+        """
+        Next token for every sequence from (batch, vocab) logits, with a single
+        device->host sync (`.tolist()`) instead of one `.item()` per sequence.
+        All-greedy batches take a fully vectorised argmax.
+        """
+        if all(s.sampling_params.temperature == 0.0 for s in sequences):
+            return logits.argmax(dim=-1).tolist()
+        tokens = [self._sample(logits[i : i + 1], seq) for i, seq in enumerate(sequences)]
+        return torch.cat(tokens).tolist()
 
     def _sample(self, logits: torch.Tensor, seq: Sequence) -> torch.Tensor:
         return Sampler.sample(
