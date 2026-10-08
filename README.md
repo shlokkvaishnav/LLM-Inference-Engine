@@ -75,7 +75,8 @@ same pool without fragmentation.
 
 ### Correctness (M1–M6, Kaggle T4, TinyLlama-1.1B)
 
-*(M7 adds benchmark scripts, not new correctness tests — see below for its own results)*
+*(M7 adds benchmark scripts, not new correctness tests — see below for its own results. The
+robustness fixes after M7 add `tests/test_engine_robustness.py` and API tests, so the current CPU suite is larger than the 28 counted here.)*
 
 Every milestone is verified token-for-token (or, for quantization, within a
 calibrated error bound) against a HuggingFace `transformers` ground truth —
@@ -119,16 +120,24 @@ paged-attention Triton kernel below) — a natural follow-up, not yet built.
 | **mini-vLLM** | 72.6 | 3.52 | 2463 MB | continuous batch + paged KV, `max_batch_size=4` |
 | vLLM (ceiling) | — | — | — | not installed (see script docstring) |
 
-**Why mini-vLLM is slower here — measured, not glossed over:**
+**Why mini-vLLM is slower here — hypotheses from reading the code, not yet profiled:**
 1. **The comparison itself isn't apples-to-apples**: this run used `max_batch_size=4`
    against 8 prompts, so mini-vLLM only ever processes half the parallelism HF's single
    `generate()` call uses natively (all 8 at once).
-2. **`PagedLlamaRunner.decode_batch` has real per-step Python overhead**: it manually loops
+2. **`PagedLlamaRunner.decode_batch` has per-step Python overhead**: it manually loops
    over Llama's 22 layers in Python, and within each layer does a per-sequence Python loop
    to write K/V into the block pool. HF's `generate()` runs one fused SDPA call per layer
-   with no per-sequence indexing. For a small batch of short sequences, that overhead can
-   outweigh paged attention's O(1)-passes-per-step advantage — the same "measure, don't
-   assume" lesson as M5's quantization speed result.
+   with no per-sequence indexing.
+3. **GQA expansion over the whole pool**: TinyLlama has 4 KV heads and 32 query heads, and
+   the runner `repeat_interleave`s the *entire* K/V pool (not just the blocks in use) up to
+   32 heads for every layer on every step (`paged_llama_runner.py`, `_paged_decode_layer`).
+   This is memory-inefficient and likely the largest single cost.
+4. **A GPU sync per sequence**: sampling calls `.item()` on each sequence's token, so
+   "O(1) forward passes per step" is not the same as "no per-sequence synchronisation".
+5. **Possible Triton recompiles**: the kernel takes `MAX_NUM_BLOCKS` as a `constexpr`, so
+   it may recompile each time the longest sequence crosses a block boundary.
+
+None of these has been profiled; they are the first things to check, in that order.
 
 ### Concurrent load test (M7, same model/hardware)
 
@@ -160,7 +169,7 @@ Hardware: Kaggle T4 (16 GB VRAM) · TinyLlama-1.1B · fp16
 - [x] **M4** Paged KV-cache — BlockManager, LIFO preemption, Triton paged-attention kernel, full engine integration (O(1) batched decode)
 - [x] **M5** Quantization — INT8 + INT4, weight-only, measured quality/speed tradeoff (see Results)
 - [x] **M6** OpenAI-compatible API — `/v1/completions` with SSE streaming, async continuous-batching engine
-- [x] **M7** Benchmark suite + concurrent load test vs HF/vLLM
+- [x] **M7** Benchmark suite + concurrent load test vs HF (real vLLM comparison is opt-in and wasn't run)
 
 ---
 
@@ -168,7 +177,7 @@ Hardware: Kaggle T4 (16 GB VRAM) · TinyLlama-1.1B · fp16
 
 ```bash
 # Install (CPU dev — no GPU needed)
-pip install -e ".[dev]"
+pip install -e ".[dev]"      # add ".[bench]" for the load-test chart / httpx client
 
 # Run tests (CPU-safe subset — GPT-2, no GPU required)
 pytest tests/ -v
@@ -191,7 +200,7 @@ uvicorn mini_vllm.api.server:app --reload
 mini_vllm/
   engine/         scheduler (+ preemption), sequence state machine,
                    LLMEngine (sync) + AsyncLLMEngine (streaming server)
-  kv_cache/       block manager, block tables, paged attention
+  kv_cache/       block manager, paged attention
                    (PyTorch reference + Triton kernel)
   model/          weight loading (swappable), dense ModelRunner (M1-M3),
                    PagedLlamaRunner (M4, paged decode for Llama models)
@@ -199,7 +208,8 @@ mini_vllm/
                    QuantizedLinear + quantize_model()
   api/            FastAPI server (SSE streaming) + OpenAI protocol types
   sampling/       greedy / top-k / top-p token sampling
-benchmarks/       quantization report + baseline/load-test scripts (M7)
+benchmarks/       quantization report + baseline/load-test scripts (M7); result
+                   CSV/PNG/JSON files are gitignored, so the tables above come from Kaggle runs
 tests/            correctness + unit tests (CPU-safe; GPU-only tests skip
                    cleanly without CUDA and are verified on Kaggle)
 notebooks/        Kaggle GPU benchmark notebook — fully self-contained
