@@ -47,6 +47,7 @@ from mini_vllm.api.protocol import (
     CompletionResponse,
 )
 from mini_vllm.engine.async_engine import AsyncLLMEngine
+from mini_vllm.engine.scheduler import QueueFullError
 from mini_vllm.engine.sequence import SamplingParams, Sequence, SequenceStatus
 from mini_vllm.kv_cache.block_manager import BlockManager
 from mini_vllm.model.loader import ModelConfig, load_model
@@ -78,6 +79,12 @@ async def lifespan(app: FastAPI):
 
     state["engine"] = AsyncLLMEngine(runner, max_batch_size=max_batch_size, block_manager=block_manager)
     state["tokenizer"] = tokenizer
+    # Hard cap on prompt + generated tokens: the model context, and (paged
+    # runner) the whole KV pool — a request that can never fit would block
+    # the waiting queue forever.
+    state["max_seq_tokens"] = min(
+        config.max_model_len, num_blocks * block_size if block_manager else config.max_model_len
+    )
     state["model_name"] = model_name
     yield
     state.clear()
@@ -90,39 +97,82 @@ def _build_sequence(prompt: str, req: CompletionRequest) -> Sequence:
     tokenizer = state["tokenizer"]
     token_ids = tokenizer.encode(prompt)
 
-    stop_ids: list[int] = []
+    # Stop strings are matched on decoded text by the engine (a stop string
+    # can span several tokens, so token-id matching would be wrong).
+    stop_strs: list[str] = []
     if req.stop:
-        stop_strs = [req.stop] if isinstance(req.stop, str) else req.stop
-        for s in stop_strs:
-            stop_ids.extend(tokenizer.encode(s))
+        stop_strs = [req.stop] if isinstance(req.stop, str) else list(req.stop)
+        stop_strs = [s for s in stop_strs if s]
 
     params = SamplingParams(
         temperature=req.temperature,
         top_p=req.top_p,
         top_k=req.top_k,
         max_tokens=req.max_tokens,
-        stop_token_ids=stop_ids,
+        stop_strings=stop_strs,
     )
     return Sequence(token_ids, params)
+
+
+def _apply_stop(text: str, stops: list[str], final: bool) -> tuple[str, bool]:
+    """
+    Truncate `text` at the earliest stop string. Returns (text, hit_stop).
+    While streaming (final=False) also withholds a trailing partial match of
+    a stop string, so "ST" isn't sent before "STOP" completes.
+    """
+    cut = min((i for i in (text.find(st) for st in stops) if i != -1), default=-1)
+    if cut != -1:
+        return text[:cut], True
+    if not final:
+        hold = 0
+        for st in stops:
+            for k in range(min(len(st) - 1, len(text)), 0, -1):
+                if text.endswith(st[:k]):
+                    hold = max(hold, k)
+                    break
+        if hold:
+            return text[:-hold], False
+    return text, False
+
+
+def _check_fits(prompt_len: int, max_tokens: int) -> None:
+    limit = state["max_seq_tokens"]
+    if prompt_len + max_tokens > limit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"prompt ({prompt_len} tokens) + max_tokens ({max_tokens}) "
+                   f"exceeds the maximum sequence length of {limit}.",
+        )
 
 
 async def _stream_completion(seq: Sequence, req: CompletionRequest, request_id: str) -> AsyncIterator[str]:
     engine: AsyncLLMEngine = state["engine"]
     tokenizer = state["tokenizer"]
+    stops = seq.sampling_params.stop_strings
     prev_text = ""
+    count = 0
 
     async for _ in engine.generate(seq):
+        count += 1
         # Re-decode the full token list each step rather than decoding just
         # the new token: multi-byte/multi-token unicode characters can span
         # token boundaries, so decoding incrementally token-by-token can
         # produce garbled partial characters. Diffing the re-decoded string
         # against what we already sent is correct at the cost of a little
         # redundant work — cheap relative to the forward pass.
-        text = tokenizer.decode(seq.output_token_ids)
+        # Only the last token's chunk carries finish_reason: the sequence can
+        # already be FINISHED while a slow client is still draining earlier tokens.
+        is_last = seq.status == SequenceStatus.FINISHED and count >= seq.num_total_generated
+        text = tokenizer.decode(seq.generated_token_ids, skip_special_tokens=True)
+        hit_stop = False
+        if stops:
+            text, hit_stop = _apply_stop(text, stops, final=is_last)
         delta = text[len(prev_text):]
         prev_text = text
 
-        finish_reason = "stop" if seq.status == SequenceStatus.FINISHED else None
+        finish_reason = (seq.finish_reason or "stop") if is_last else None
+        if hit_stop:
+            finish_reason = "stop"
         chunk = CompletionChunk(
             id=request_id,
             model=req.model,
@@ -146,7 +196,15 @@ async def completions(req: CompletionRequest):
     engine: AsyncLLMEngine = state["engine"]
     tokenizer = state["tokenizer"]
     seq = _build_sequence(req.prompt, req)
+    if not seq.prompt_token_ids:
+        raise HTTPException(status_code=400, detail="prompt must not be empty.")
+    _check_fits(seq.prompt_length, req.max_tokens)
     request_id = f"cmpl-{uuid.uuid4().hex[:24]}"
+
+    try:
+        engine.submit(seq)
+    except QueueFullError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     if req.stream:
         return StreamingResponse(
@@ -156,8 +214,13 @@ async def completions(req: CompletionRequest):
     async for _ in engine.generate(seq):
         pass
 
-    text = tokenizer.decode(seq.output_token_ids)
-    finish_reason = "length" if len(seq.output_token_ids) >= req.max_tokens else "stop"
+    text = tokenizer.decode(seq.generated_token_ids, skip_special_tokens=True)
+    finish_reason = seq.finish_reason or "stop"
+    stops = seq.sampling_params.stop_strings
+    if stops:
+        text, hit_stop = _apply_stop(text, stops, final=True)
+        if hit_stop:
+            finish_reason = "stop"
     return CompletionResponse(
         id=request_id,
         model=req.model,
