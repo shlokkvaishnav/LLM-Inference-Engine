@@ -131,7 +131,8 @@ docker compose up api-cpu    # CPU only, port 8001
 
 ## Results
 
-All GPU numbers are from a Kaggle T4 (16 GB VRAM) with TinyLlama-1.1B in fp16.
+All GPU numbers are from a Kaggle T4 (16 GB VRAM) with TinyLlama-1.1B in fp16 (benchmarks
+last re-run 8 Oct 2026 on the current code).
 
 ### Correctness
 
@@ -157,9 +158,13 @@ shrinks memory but does not speed up compute):
 
 | | Size | Quality (cos-sim vs fp16) | Speed |
 |---|---|---|---|
-| fp16 | 1937.8 MB | 1.0000 (baseline) | 99.7 tok/s |
-| INT8 | 970.5 MB (2x smaller) | 1.0000 | 42.3 tok/s (2.3x slower) |
-| INT4 | 486.0 MB (4x smaller) | 0.9785 | 22.2 tok/s (4.4x slower) |
+| fp16 | 1937.8 MB | 1.0000 (baseline) | 50.2 tok/s |
+| INT8 | 970.5 MB (2x smaller) | 1.0000 | 42.2 tok/s (1.2x slower) |
+| INT4 | 486.0 MB (4x smaller) | 0.9785 | 22.2 tok/s (2.3x slower) |
+
+Size and quality are deterministic. Speed varies between runs: fp16 measured 99.7 tok/s in an
+earlier run on the same setup (INT8 and INT4 reproduced at 42 and 22 tok/s), so the slowdown
+factors above may understate the cost of INT8 and INT4.
 
 Naive dequantize-on-the-fly pays a dequantization step per matmul without saving memory
 bandwidth during compute, so the memory saving is real but decode is *slower*. A genuine
@@ -172,12 +177,14 @@ weight, which is not implemented.
 
 | System | Throughput (tok/s) | Wall-clock (s) | Peak GPU mem | Notes |
 |--------|--------------------|-----------------|--------------|-------|
-| HF `generate()` — naive | 39.2 | 6.53 | 2212 MB | sequential, one prompt at a time |
-| HF `generate()` — batched | 285.8 | 0.90 | 2223 MB | single call, all 8 prompts batched |
-| **mini-vLLM** | 72.6 | 3.52 | 2463 MB | continuous batch + paged KV, `max_batch_size=4` |
+| HF `generate()` — naive | 39.3 | 6.52 | 2212 MB | sequential, one prompt at a time |
+| HF `generate()` — batched | 274.6 | 0.93 | 2223 MB | single call, all 8 prompts batched |
+| **mini-vLLM** | 34.4 | 7.45 | 2463 MB | continuous batch + paged KV, `max_batch_size=4` |
 | vLLM | — | — | — | opt-in (`--compare-vllm`), not run |
 
-mini-vLLM is slower than batched HF here. These are hypotheses from reading the code, not
+mini-vLLM is slower than batched HF here, and its number is the least stable: an earlier run on
+the same setup measured 72.6 tok/s (3.52 s) against 34.4 tok/s now, while the two HF baselines
+agreed within about 4%. The cause of that spread has not been investigated. These are hypotheses from reading the code, not
 profiled results:
 1. **The comparison is not apples-to-apples**: this run used `max_batch_size=4` against 8
    prompts, so mini-vLLM only gets half the parallelism of HF's single batched call.
@@ -198,15 +205,16 @@ profiled results:
 
 | Concurrency | P50 TTFT (ms) | P95 TTFT (ms) | P99 TTFT (ms) | Throughput (tok/s) |
 |---|---|---|---|---|
-| 1 | 58 | 58 | 58 | 40.1 |
-| 2 | 105 | 117 | 118 | 64.8 |
-| 4 | 138 | 163 | 167 | 108.4 |
-| 8 | 208 | 240 | 240 | 198.7 |
-| 16 | 768 | 1420 | 1421 | 211.0 |
+| 1 | 35 | 35 | 35 | 39.1 |
+| 2 | 64 | 90 | 93 | 65.5 |
+| 4 | 139 | 184 | 184 | 113.2 |
+| 8 | 149 | 151 | 151 | 203.2 |
+| 16 | 754 | 1470 | 1470 | 203.2 |
 
-Throughput keeps climbing through concurrency 16, while time-to-first-token stays low up to 8
-(the server's default `max_batch_size`) and then rises as requests queue — continuous batching
-under varying concurrent load, a more realistic measure than one fixed static batch.
+Throughput climbs up to concurrency 8 (the server's default `max_batch_size`) and then
+plateaus, while time-to-first-token stays low up to 8 and rises sharply at 16 as requests
+queue — continuous batching under varying concurrent load, a more realistic measure than one
+fixed static batch.
 
 Benchmark CSV, PNG and JSON outputs are gitignored; regenerate them with the scripts in
 `benchmarks/` or the Kaggle notebook.
