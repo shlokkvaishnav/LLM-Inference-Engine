@@ -195,9 +195,11 @@ async def completions(req: CompletionRequest):
 
     engine: AsyncLLMEngine = state["engine"]
     tokenizer = state["tokenizer"]
-    seq = _build_sequence(req.prompt, req)
-    if not seq.prompt_token_ids:
+    # Check the string, not the token ids: Llama tokenizers prepend BOS, so an
+    # empty prompt still encodes to one token.
+    if not req.prompt:
         raise HTTPException(status_code=400, detail="prompt must not be empty.")
+    seq = _build_sequence(req.prompt, req)
     _check_fits(seq.prompt_length, req.max_tokens)
     request_id = f"cmpl-{uuid.uuid4().hex[:24]}"
 
