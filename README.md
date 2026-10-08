@@ -73,14 +73,15 @@ same pool without fragmentation.
 
 ## Results
 
-### Correctness (M1–M6, Kaggle T4, TinyLlama-1.1B)
+### Correctness (M1–M6 + engine robustness, Kaggle T4, TinyLlama-1.1B)
 
-*(M7 adds benchmark scripts, not new correctness tests — see below for its own results. The
-robustness fixes after M7 add `tests/test_engine_robustness.py` and API tests, so the current CPU suite is larger than the 28 counted here.)*
+*(M7 adds benchmark scripts, not new correctness tests — see below for its own results.)*
 
 Every milestone is verified token-for-token (or, for quantization, within a
 calibrated error bound) against a HuggingFace `transformers` ground truth —
-28/28 tests passing:
+**38/38 tests passing on the GPU**, none skipped (last run: 8 Oct 2026, after the
+post-M7 audit fixes). The same suite gives 36 passed / 2 skipped on CPU, where the
+two GPU-only tests (Triton kernel, real-model paged decode) are skipped.
 
 | Suite | Tests | What it proves |
 |---|---|---|
@@ -88,7 +89,8 @@ calibrated error bound) against a HuggingFace `transformers` ground truth —
 | M4 BlockManager + Scheduler + paged attention (incl. Triton) | 12/12 | block allocation, LIFO preemption under memory pressure, paged attention kernel matches dense attention on scattered blocks |
 | M4 engine integration (`PagedLlamaRunner`, real model) | 3/3 | full paged decode path matches HF, GPU, real weights |
 | M5 quantization | 6/6 | INT8/INT4 round-trip + model-level error bounds |
-| M6 API server (real model + `PagedLlamaRunner`, concurrency) | 4/4 | streaming == non-streaming, concurrent requests match solo-run baseline |
+| M6 API server (real model + `PagedLlamaRunner`, concurrency) | 8/8 | streaming == non-streaming, concurrent requests match solo-run baseline, bad parameters / oversized / empty prompts rejected, stop strings truncate output |
+| Engine robustness | 6/6 | preemption recompute matches an unconstrained run, abort while waiting, engine-loop failure propagates and recovers, stop strings spanning tokens |
 
 ### Quantization tradeoff (M5, real TinyLlama-1.1B, Kaggle T4)
 
