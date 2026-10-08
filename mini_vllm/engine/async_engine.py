@@ -1,13 +1,13 @@
 """
-AsyncLLMEngine — async wrapper around LLMEngine for the API server (M6).
+AsyncLLMEngine — async wrapper around LLMEngine for the API server.
 
 LLMEngine.run_until_done() is a blocking, synchronous loop: call step()
 until every sequence finishes. That's fine for offline batch generation
-(what M1-M5's tests do) but wrong for a server, where requests arrive at
+(what the offline tests do) but wrong for a server, where requests arrive at
 arbitrary times and each needs its own token-by-token stream.
 
 AsyncLLMEngine runs ONE background asyncio task that repeatedly calls
-engine.step() — the same continuous-batching step from M3/M4 — and after
+engine.step() — the same continuous-batching step the offline engine runs — and after
 each step, pushes the token each scheduled sequence just generated into
 that sequence's own asyncio.Queue. A request's async generator just reads
 from its queue; it doesn't know or care that other requests are sharing

@@ -1,4 +1,4 @@
-"""Block manager unit tests — Milestone 4. Pure Python, no GPU/model needed."""
+"""Block manager unit tests. Pure Python, no GPU/model needed."""
 import pytest
 
 from mini_vllm.kv_cache.block_manager import BlockManager

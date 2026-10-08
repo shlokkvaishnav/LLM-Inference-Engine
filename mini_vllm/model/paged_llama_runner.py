@@ -1,9 +1,9 @@
 """
-Paged decode path for Llama-family models — Milestone 4 engine integration.
+Paged decode path for Llama-family models.
 
 Why a separate class instead of extending ModelRunner:
-  ModelRunner.decode_one (M3) is proven correct against HF token-for-token
-  and stays untouched here — nothing in this file can regress M1-M3. This
+  ModelRunner.decode_one is proven correct against HF token-for-token
+  and stays untouched here — nothing in this file can regress the dense path. This
   class targets Llama specifically (TinyLlama is the production model) and
   replaces ONLY the attention core with the paged kernel; every other
   sub-layer (RMSNorm, RoPE, SwiGLU MLP, Linear projections) calls the SAME
@@ -13,13 +13,13 @@ Why a separate class instead of extending ModelRunner:
 
 Interface parity with ModelRunner so LLMEngine can drive either:
   prefill_and_store(sequences) -> list[int]
-  decode_batch(sequences)      -> list[int]   (batched — the M4 payoff: ONE
+  decode_batch(sequences)      -> list[int]   (batched — the payoff: ONE
                                   forward pass for the WHOLE running batch,
                                   vs ModelRunner.decode_one's one-per-sequence)
   free_seq(seq_id) -> None
 
-Prefill still runs through the model's own batched forward (reusing M2's
-already-correct left-padded logic) and only copies the resulting K/V into
+Prefill still runs through the model's own batched forward (reusing the dense
+runner's already-correct left-padded logic) and only copies the resulting K/V into
 the block pool — only the DECODE step is reimplemented manually. This
 mirrors real vLLM, which also uses a different kernel for prefill
 (contiguous) than for decode (paged).
@@ -187,7 +187,7 @@ class PagedLlamaRunner:
 
     @staticmethod
     def _layer_kv(past_kv: Any, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Same version-straddling logic as ModelRunner._slice_kv (M3 fix)."""
+        """Mirrors the version-straddling logic of ModelRunner._slice_kv."""
         if hasattr(past_kv, "layers"):
             layer = past_kv.layers[layer_idx]
             return layer.keys, layer.values

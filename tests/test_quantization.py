@@ -1,7 +1,7 @@
 """
-Quantization correctness tests — Milestone 5.
+Quantization correctness tests.
 
-Unlike M1-M4 (exact token-for-token match required), quantization is
+Unlike the decode-path tests (exact token-for-token match required), quantization is
 inherently lossy — the correctness bar here is BOUNDED ERROR, not exact
 equality. Thresholds below were calibrated by measuring actual error on
 random weights of realistic transformer magnitude (~N(0, 0.02)), not

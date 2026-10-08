@@ -1,14 +1,14 @@
 """
-Continuous batching scheduler — Milestone 3 (admission) + Milestone 4 (preemption).
+Continuous batching scheduler: FCFS admission plus optional memory-pressure preemption.
 
 The scheduler answers one question every decode step:
   "Given the current WAITING queue and RUNNING batch,
    which sequences run this step, which get preempted, and which are done?"
 
-M3 policy: FCFS admission, no memory accounting — a Scheduler(block_manager=None)
-  behaves exactly like the original M3 scheduler (batch-size gating only).
+Without a block manager: FCFS admission, no memory accounting — a
+  Scheduler(block_manager=None) gates on batch size only.
 
-M4 policy: pass a BlockManager and step() also does memory-pressure preemption.
+With a block manager: step() also does memory-pressure preemption.
   Two independent phases, each bounded (no thrashing):
 
   1. Preemption — for every RUNNING sequence (checked LIFO: most-recently
@@ -22,7 +22,7 @@ M4 policy: pass a BlockManager and step() also does memory-pressure preemption.
      rule, admitting seq B by evicting seq A, then evicting seq B on the next
      iteration to re-admit seq A, could oscillate forever. If the head of the
      waiting queue doesn't fit, later waiters are left blocked too (simple
-     head-of-line policy — no queue-jumping in M4).
+     head-of-line policy — no queue-jumping).
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -44,7 +44,7 @@ class SchedulerOutput:
 
 class Scheduler:
     """
-    FCFS continuous batching scheduler, with optional M4 memory-pressure preemption.
+    FCFS continuous batching scheduler, with optional memory-pressure preemption.
 
     Invariant: len(self.running) <= max_batch_size at all times.
     """
@@ -57,7 +57,7 @@ class Scheduler:
     ) -> None:
         self.max_batch_size = max_batch_size
         self.max_waiting = max_waiting
-        self.block_manager = block_manager   # None = M3 behavior, no memory accounting
+        self.block_manager = block_manager   # None = no memory accounting (FCFS only)
         self.waiting: list[Sequence] = []
         self.running: list[Sequence] = []
 
@@ -90,9 +90,9 @@ class Scheduler:
 
     def _preempt_if_needed(self) -> list[Sequence]:
         """
-        M4: evict RUNNING sequences (LIFO — most recently admitted first)
+        Evict RUNNING sequences (LIFO — most recently admitted first)
         that won't have room for their next generated token and can't get
-        a new block. No-op when block_manager is None (M3 behavior).
+        a new block. No-op when block_manager is None.
         """
         if self.block_manager is None:
             return []

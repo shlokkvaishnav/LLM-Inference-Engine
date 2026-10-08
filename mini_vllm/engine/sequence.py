@@ -25,8 +25,8 @@ class Sequence:
     """
     The full mutable state of one request.
 
-    Holds prompt tokens, generated tokens, sampling config, and — from
-    Milestone 4 onward — the logical block table the BlockManager assigns.
+    Holds prompt tokens, generated tokens, sampling config, and
+    the logical block table the BlockManager assigns.
     """
 
     _id_counter = 0
@@ -47,7 +47,7 @@ class Sequence:
         self.sampling_params = sampling_params
         self.status = SequenceStatus.WAITING
         self.finish_reason: str | None = None   # "stop" | "length", set when finished
-        # Populated by BlockManager in Milestone 4.
+        # Populated by BlockManager.
         # Each entry is a physical block ID in the KV-cache pool.
         self.block_table: list[int] = []
 

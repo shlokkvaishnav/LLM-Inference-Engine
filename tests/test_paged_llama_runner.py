@@ -1,12 +1,12 @@
 """
-PagedLlamaRunner correctness test — Milestone 4 engine integration.
+PagedLlamaRunner correctness test.
 
 Strategy: instantiate a tiny, randomly-initialized LlamaForCausalLM (real
 Llama architecture class, no download — fast on CPU) and run the SAME
 prompts through both:
-  - ModelRunner.generate()            (M1-M3, dense, already proven correct
+  - ModelRunner.generate()            (dense, already proven correct
                                         against real HF token-for-token)
-  - PagedLlamaRunner (prefill_and_store + decode_batch, M4, paged)
+  - PagedLlamaRunner (prefill_and_store + decode_batch, paged)
 
 If both produce identical greedy tokens on identical weights, the paged
 implementation is a provably faithful reimplementation of the same
@@ -87,7 +87,7 @@ def test_paged_llama_matches_dense_generate(tiny_model):
         max_model_len = 64
         trust_remote_code = False
 
-    # --- Dense baseline (M1-M3, already proven correct) ---
+    # --- Dense baseline (already proven correct) ---
     dense_runner = ModelRunner(tiny_model, tokenizer, _Config())
     dense_seqs = [
         Sequence(list(p), SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS))
@@ -96,7 +96,7 @@ def test_paged_llama_matches_dense_generate(tiny_model):
     dense_runner.generate(dense_seqs)
     dense_outputs = [s.output_token_ids[:] for s in dense_seqs]
 
-    # --- Paged path (M4) ---
+    # --- Paged path ---
     block_manager = BlockManager(num_blocks=64, block_size=4)
     paged_runner = PagedLlamaRunner(
         tiny_model, tokenizer, block_manager, dtype=torch.float32, device="cpu"

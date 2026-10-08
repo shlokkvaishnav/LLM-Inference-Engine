@@ -1,5 +1,5 @@
 """
-Paged attention — Milestone 4c.
+Paged attention.
 
 This is the kernel that makes paged KV-cache actually usable: given a query
 for the token being decoded, and a KV-cache pool where each sequence's data

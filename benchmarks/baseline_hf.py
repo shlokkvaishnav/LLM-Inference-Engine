@@ -1,12 +1,12 @@
 """
 Baseline benchmark: naive HF generate() vs static-batched HF generate() vs
-mini-vLLM (continuous batching + paged KV-cache) — Milestone 7.
+mini-vLLM (continuous batching + paged KV-cache).
 
 Three systems, same prompts, same model, same hardware:
   naive:     transformers.generate() called once per prompt, sequentially —
              the worst case: no batching at all, GPU idle between requests.
   batched:   transformers.generate() called ONCE with all prompts as one
-             left-padded batch — HF's own batching, not our M2 logic.
+             left-padded batch — HF's own batching, not our engine's.
   mini-vLLM: LLMEngine (+ PagedLlamaRunner on CUDA/Llama, else ModelRunner)
              processes all prompts via continuous batching: admits up to
              max_batch_size at once, retires and admits more as they finish.

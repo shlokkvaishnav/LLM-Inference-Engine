@@ -1,5 +1,5 @@
 """
-API server tests — Milestone 6.
+API server tests.
 
 Runs on CPU with GPT-2 by default (fast, deterministic greedy decoding).
 Override via the SAME env vars server.py itself reads (no _TEST_ infix —
@@ -115,8 +115,8 @@ async def test_concurrent_requests_interleave_correctly():
     alone — proves AsyncLLMEngine's background step loop interleaves
     multiple streams via continuous batching without corrupting either one.
 
-    Ground truth uses ModelRunner (dense, M1-M3) directly even when the
-    server itself is using PagedLlamaRunner (M4, for Llama-on-CUDA) —
+    Ground truth uses ModelRunner (dense) directly even when the
+    server itself is using PagedLlamaRunner (for Llama-on-CUDA) —
     test_paged_llama_runner.py already proves those two produce identical
     output, so ModelRunner remains a valid independent baseline either way.
     """

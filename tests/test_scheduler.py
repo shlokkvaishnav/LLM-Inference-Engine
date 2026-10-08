@@ -1,4 +1,4 @@
-"""Scheduler unit tests — Milestone 3 (admission) + Milestone 4 (preemption).
+"""Scheduler unit tests (admission and preemption).
 
 All pure Python: Scheduler + Sequence + BlockManager, no model/GPU needed.
 """

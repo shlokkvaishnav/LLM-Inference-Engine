@@ -1,10 +1,10 @@
 """
 ModelRunner: orchestrates forward passes over sequences.
 
-Milestone 1/2: generate() — batched prefill→decode for a fixed group of
+Static batching: generate() — batched prefill→decode for a fixed group of
   sequences. The whole batch flows together until the last one finishes.
 
-Milestone 3: prefill_and_store() + decode_one() + free_seq() — per-sequence
+Continuous batching: prefill_and_store() + decode_one() + free_seq() — per-sequence
   KV cache storage that the continuous-batching engine loop drives.
 
 Position IDs note (why we pass them explicitly):
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# KV-cache helpers (M3)
+# KV-cache helpers
 # ---------------------------------------------------------------------------
 
 def _slice_kv(past_kv: Any, i: int) -> Any:
@@ -100,7 +100,7 @@ class ModelRunner:
         self.config = config
         self.device = torch.device(config.device)
 
-        # Per-sequence KV cache storage for M3 (continuous batching).
+        # Per-sequence KV cache storage (continuous batching).
         # Key: seq_id  Value: DynamicCache or tuple, batch dim = 1
         self._kv_cache: dict[int, Any] = {}
         # Key: seq_id  Value: attention mask of shape (1, seq_len)
@@ -218,7 +218,7 @@ class ModelRunner:
         return tokens, out.past_key_values, full_mask
 
     # -----------------------------------------------------------------------
-    # M2 — static batching
+    # Static batching
     # -----------------------------------------------------------------------
 
     def generate(self, sequences: list[Sequence]) -> list[Sequence]:
@@ -227,7 +227,7 @@ class ModelRunner:
 
         All sequences run together as one fixed batch. Sequences that hit EOS
         early stay in the tensor but their tokens are discarded — the wasted
-        compute is what M3 fixes with continuous batching.
+        compute is what continuous batching avoids.
         """
         eos_id = getattr(self.tokenizer, "eos_token_id", None)
         finished = [False] * len(sequences)
@@ -255,7 +255,7 @@ class ModelRunner:
         return sequences
 
     # -----------------------------------------------------------------------
-    # M3 — per-sequence KV cache
+    # Per-sequence KV cache (continuous batching)
     # -----------------------------------------------------------------------
 
     def prefill_and_store(self, sequences: list[Sequence]) -> list[int]:
@@ -277,8 +277,8 @@ class ModelRunner:
         Decode one step for a single sequence using its stored KV cache.
 
         Runs one forward pass (batch=1). O(N) passes per decode step — correct
-        but not optimal. M4 replaces this with a single batched paged-attention
-        pass regardless of how many sequences are in flight.
+        but not optimal. PagedLlamaRunner.decode_batch replaces this with a single
+        batched paged-attention pass regardless of how many sequences are in flight.
 
         Stores out.past_key_values directly (no slicing needed since batch=1).
         """

@@ -1,5 +1,5 @@
 """
-Paged KV-cache block manager — Milestone 4.
+Paged KV-cache block manager.
 
 Core idea: instead of allocating a contiguous GPU tensor per sequence
 (which fragments badly and caps batch size to however many fit), we divide
@@ -13,7 +13,7 @@ Benefits:
   - Prefix caching (future): blocks for shared prefixes can be ref-counted
 
 This module is pure bookkeeping — no tensors, no GPU. It decides WHICH
-block IDs belong to a sequence. The actual paged-attention kernel (M4b)
+block IDs belong to a sequence. The actual paged-attention kernel
 uses those IDs to gather KV tensors scattered across the pool.
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ class PhysicalBlock:
     def __init__(self, block_id: int, block_size: int) -> None:
         self.block_id = block_id
         self.block_size = block_size  # number of tokens this block can hold
-        self.ref_count = 0            # >1 means shared (prefix caching, Milestone 4+)
+        self.ref_count = 0            # >1 means shared (reserved for prefix caching, not implemented)
 
     def __repr__(self) -> str:
         return f"Block(id={self.block_id}, refs={self.ref_count})"

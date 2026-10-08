@@ -1,5 +1,5 @@
 """
-FastAPI server with SSE streaming — Milestone 6.
+FastAPI server with SSE streaming.
 
 Endpoint: POST /v1/completions
   - Non-streaming: returns CompletionResponse JSON
@@ -7,13 +7,12 @@ Endpoint: POST /v1/completions
 
 The server is a thin adapter: it translates HTTP requests into Sequence
 objects, hands them to AsyncLLMEngine, and streams tokens back. No
-inference logic lives here — that's entirely M1-M5's job.
+inference logic lives here — that's entirely the engine's job.
 
 Model/device/batching are configured via environment variables so the same
 code serves TinyLlama on a Kaggle/cloud GPU or GPT-2 on a laptop CPU for
-local testing (mirrors the MINI_VLLM_TEST_MODEL/DEVICE convention already
-used by tests/test_correctness.py and benchmarks/quantization_report.py,
-just without the _TEST_ infix since this is the actual runtime, not a test):
+local testing (the correctness tests and quantization report read the same
+settings with a _TEST_ infix, e.g. MINI_VLLM_TEST_MODEL):
 
   MINI_VLLM_MODEL            default: TinyLlama/TinyLlama-1.1B-Chat-v1.0
   MINI_VLLM_DEVICE            default: cuda if available else cpu
@@ -21,8 +20,8 @@ just without the _TEST_ infix since this is the actual runtime, not a test):
   MINI_VLLM_NUM_BLOCKS        default: 512   (paged KV-cache pool, Llama+GPU only)
   MINI_VLLM_BLOCK_SIZE        default: 16
 
-Runner selection: PagedLlamaRunner (M4, paged attention) when running a
-Llama-family model on CUDA; ModelRunner (M1-M3, dense) otherwise — e.g. for
+Runner selection: PagedLlamaRunner (paged attention) when running a
+Llama-family model on CUDA; ModelRunner (dense) otherwise — e.g. for
 GPT-2 or CPU-only deployments, where PagedLlamaRunner's Llama-specific
 layer access wouldn't apply anyway.
 

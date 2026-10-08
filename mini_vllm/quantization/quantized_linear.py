@@ -1,11 +1,11 @@
 """
 Drop-in replacement for nn.Linear that stores weights quantized and
-dequantizes on the fly at forward time — Milestone 5.
+dequantizes on the fly at forward time.
 
 quantize_model() walks a loaded HF model and swaps matching nn.Linear
 submodules in place, so ModelRunner/PagedLlamaRunner can drive a quantized
 model exactly like a full-precision one — quantization is orthogonal to
-M3 (scheduling) and M4 (paging): neither knows or cares that the Linear
+scheduling and paging: neither knows or cares that the Linear
 layers underneath are int8/int4.
 """
 from __future__ import annotations

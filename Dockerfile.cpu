@@ -1,4 +1,4 @@
-# CPU-only image for local development and CI.
+# CPU-only image for local development.
 # Much smaller than the CUDA base — no GPU needed.
 FROM python:3.12-slim
 

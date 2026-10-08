@@ -23,7 +23,7 @@ env/
 models/
 ~/.cache/huggingface/
 
-# Benchmark output — committed selectively, not automatically
+# Benchmark output — never committed; regenerate with the scripts in benchmarks/
 benchmarks/results/*.png
 benchmarks/results/*.json
 benchmarks/results/*.csv

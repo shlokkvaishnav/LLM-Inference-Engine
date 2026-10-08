@@ -1,5 +1,5 @@
 """
-Weight-only quantization primitives — Milestone 5.
+Weight-only quantization primitives.
 
 Scheme: symmetric, per-output-channel, round-to-nearest (RTN). For a weight
 matrix of shape (out_features, in_features), each ROW gets its own scale —
@@ -26,8 +26,8 @@ IMPORTANT — what this does and doesn't buy you:
   in full precision. Real inference speedups (e.g. bitsandbytes, GPTQ
   kernels) come from a FUSED low-precision kernel that never materializes
   the full-precision tensor, so the matmul itself reads less memory
-  bandwidth. That's a natural M5+ follow-up (a Triton int8 GEMM, structurally
-  similar to the M4 paged-attention kernel), not implemented here — measure,
+  bandwidth. That would be a future extension (a Triton int8 GEMM, structurally
+  similar to the paged-attention kernel), not implemented here — measure,
   don't assume, which is exactly what benchmarks/quantization_report.py does.
 """
 from __future__ import annotations

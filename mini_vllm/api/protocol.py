@@ -1,4 +1,4 @@
-"""OpenAI-compatible request/response types — Milestone 6."""
+"""OpenAI-compatible request/response types."""
 from __future__ import annotations
 from typing import Literal, Optional, Union
 from pydantic import BaseModel, Field

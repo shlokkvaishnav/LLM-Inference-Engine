@@ -132,7 +132,7 @@ def test_continuous_batch_matches_single(runner, hf_model):
     Every sequence driven through the continuous batching engine produces
     identical tokens to the single-sequence HuggingFace baseline.
 
-    Why this matters: M3 stores and restores per-sequence KV caches and
+    Why this matters: the engine stores and restores per-sequence KV caches and
     admits sequences at different times. A bug in _to_tuple_kv / _slice_kv
     or in the decode_one position encoding would cause divergence here.
 
@@ -162,7 +162,7 @@ def test_continuous_batch_matches_single(runner, hf_model):
     for seq, prompt in zip(engine_seqs, FIXED_PROMPTS):
         expected = _hf_generate(model, tokenizer, prompt, MAX_NEW_TOKENS)
         assert seq.output_token_ids == expected, (
-            f"M3 engine mismatch on {prompt!r}\n"
+            f"engine mismatch on {prompt!r}\n"
             f"  HF:     {expected}\n"
             f"  engine: {seq.output_token_ids}\n"
             f"  HF decoded:     {tokenizer.decode(expected)!r}\n"

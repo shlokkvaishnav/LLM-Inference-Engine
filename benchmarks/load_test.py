@@ -1,6 +1,6 @@
 """
 Concurrent load test: bursty multi-client traffic against the running API
-server — Milestone 7.
+server.
 
 Ramps concurrency 1 -> 2 -> 4 -> ... -> max_concurrency (each level is a
 fresh burst of exactly `concurrency` simultaneous streaming requests, not a

@@ -1,6 +1,6 @@
 # GPU runtime image — for local GPU runs and reproducible benchmarks.
 # For CPU development: `pip install -e ".[dev]"` in your local env is enough.
-FROM pytorch/pytorch:2.12.0-cuda12.4-cudnn9-runtime
+FROM pytorch/pytorch:2.12.0-cuda12.6-cudnn9-runtime
 
 WORKDIR /app
 

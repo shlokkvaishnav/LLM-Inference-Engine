@@ -1,5 +1,5 @@
 """
-M5 quantization report: size / quality / speed tradeoff for fp16 baseline
+Quantization report: size / quality / speed tradeoff for fp16 baseline
 vs INT8 vs INT4 weight-only quantization, on the real production model.
 
 Measures three independent things — don't assume one implies another:
@@ -73,7 +73,7 @@ def measure_quality(baseline_model, quant_model, tokenizer) -> float:
 
 
 def measure_speed(model, tokenizer, config) -> float:
-    """Tokens/sec across all prompts, generated via the dense M1-M3 runner."""
+    """Tokens/sec across all prompts, generated via the dense runner."""
     runner = ModelRunner(model, tokenizer, config)
     seqs = [
         Sequence(tokenizer.encode(p), SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS))

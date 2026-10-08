@@ -1,5 +1,5 @@
 """
-Paged attention correctness tests — Milestone 4c.
+Paged attention correctness tests.
 
 paged_attention_reference tests run everywhere (pure PyTorch, CPU is fine —
 this is what proves the scatter-gather math is correct).
