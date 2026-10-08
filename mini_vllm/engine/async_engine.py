@@ -126,6 +126,10 @@ class AsyncLLMEngine:
         finally:
             self._abort(seq)
 
+    def abort(self, seq: Sequence) -> None:
+        """Drop a submitted sequence that will never be consumed."""
+        self._abort(seq)
+
     def _abort(self, seq: Sequence) -> None:
         """Idempotent — safe even if the sequence already finished normally."""
         self.engine.scheduler.free(seq)

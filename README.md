@@ -118,9 +118,13 @@ curl http://localhost:8000/v1/completions \
 ```
 
 Set `"stream": true` for server-sent events. Supported fields: `max_tokens`, `temperature`,
-`top_p`, `top_k`, `stop` (string or list), `stream`. Errors: `400` for an empty prompt, a prompt
-that cannot fit, or a list of prompts; `422` for out-of-range parameters; `503` when the waiting
-queue is full. `GET /health` reports the loaded model.
+`top_p`, `top_k`, `stop` (string or list), `stream`. `prompt` may be a string or a list of strings;
+a list returns one choice per prompt (`index` matches the position), and when streaming the
+per-prompt chunks are interleaved. Responses carry `usage` (`prompt_tokens`, `completion_tokens`,
+`total_tokens`); a stream ends with a chunk that has an empty `choices` list and the `usage`.
+Errors: `400` for an empty prompt or one that cannot fit (any bad prompt in a list rejects the
+whole request); `422` for out-of-range parameters; `503` when the waiting queue is full.
+`GET /v1/models` lists the loaded model and `GET /health` reports its status.
 
 ### Docker
 
@@ -266,8 +270,7 @@ Dockerfile.cpu    CPU image
 - Prefix caching is not implemented (block `ref_count` is reserved for it).
 - The paged runner supports Llama-family models on CUDA only; other models use the dense runner.
 - Quantization saves memory but is slower than fp16 (see above).
-- A single request takes one prompt; list prompts are rejected. There is no chat endpoint,
-  token-usage reporting, authentication or rate limiting.
+- There is no chat endpoint, authentication or rate limiting.
 - The server is a single process holding one model; running several uvicorn workers loads
   one copy per worker.
 

@@ -1,7 +1,7 @@
 """
 FastAPI server with SSE streaming.
 
-Endpoint: POST /v1/completions
+Endpoints: POST /v1/completions, GET /v1/models, GET /health
   - Non-streaming: returns CompletionResponse JSON
   - Streaming (stream=true): returns text/event-stream of CompletionChunk
 
@@ -30,7 +30,9 @@ tests can override env vars right up until the TestClient triggers startup.
 """
 from __future__ import annotations
 
+import asyncio
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -44,6 +46,9 @@ from mini_vllm.api.protocol import (
     CompletionChunk,
     CompletionRequest,
     CompletionResponse,
+    ModelCard,
+    ModelList,
+    Usage,
 )
 from mini_vllm.engine.async_engine import AsyncLLMEngine
 from mini_vllm.engine.scheduler import QueueFullError
@@ -85,6 +90,7 @@ async def lifespan(app: FastAPI):
         config.max_model_len, num_blocks * block_size if block_manager else config.max_model_len
     )
     state["model_name"] = model_name
+    state["created"] = int(time.time())
     yield
     state.clear()
 
@@ -144,7 +150,13 @@ def _check_fits(prompt_len: int, max_tokens: int) -> None:
         )
 
 
-async def _stream_completion(seq: Sequence, req: CompletionRequest, request_id: str) -> AsyncIterator[str]:
+def _usage(seqs: list[Sequence]) -> Usage:
+    prompt = sum(s.original_prompt_length for s in seqs)
+    completion = sum(s.num_total_generated for s in seqs)
+    return Usage(prompt_tokens=prompt, completion_tokens=completion, total_tokens=prompt + completion)
+
+
+async def _stream_sequence(seq: Sequence, index: int, req: CompletionRequest, request_id: str) -> AsyncIterator[str]:
     engine: AsyncLLMEngine = state["engine"]
     tokenizer = state["tokenizer"]
     stops = seq.sampling_params.stop_strings
@@ -175,58 +187,102 @@ async def _stream_completion(seq: Sequence, req: CompletionRequest, request_id: 
         chunk = CompletionChunk(
             id=request_id,
             model=req.model,
-            choices=[CompletionChoice(text=delta, index=0, finish_reason=finish_reason)],
+            choices=[CompletionChoice(text=delta, index=index, finish_reason=finish_reason)],
         )
         yield f"data: {chunk.model_dump_json()}\n\n"
 
-    yield "data: [DONE]\n\n"
+
+async def _stream_completion(seqs: list[Sequence], req: CompletionRequest, request_id: str) -> AsyncIterator[str]:
+    """Merge the per-sequence streams (fan-in) into one SSE stream."""
+    queue: asyncio.Queue = asyncio.Queue()
+    _DONE = object()
+
+    async def pump(seq: Sequence, index: int) -> None:
+        try:
+            async for event in _stream_sequence(seq, index, req, request_id):
+                await queue.put(event)
+        except Exception as exc:  # surface engine failures to the consumer
+            await queue.put(exc)
+        finally:
+            await queue.put(_DONE)
+
+    tasks = [asyncio.create_task(pump(seq, i)) for i, seq in enumerate(seqs)]
+    try:
+        remaining = len(tasks)
+        while remaining:
+            event = await queue.get()
+            if event is _DONE:
+                remaining -= 1
+            elif isinstance(event, Exception):
+                raise event
+            else:
+                yield event
+        final = CompletionChunk(id=request_id, model=req.model, choices=[], usage=_usage(seqs))
+        yield f"data: {final.model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        # Client disconnect or error: cancelling a pump aborts its sequence.
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @app.post("/v1/completions", response_model=None)
 async def completions(req: CompletionRequest):
-    if isinstance(req.prompt, list):
-        raise HTTPException(
-            status_code=400,
-            detail="Batch prompts in a single request aren't supported yet — "
-                   "send one prompt per request (continuous batching still "
-                   "interleaves multiple concurrent requests efficiently).",
-        )
-
     engine: AsyncLLMEngine = state["engine"]
     tokenizer = state["tokenizer"]
-    # Check the string, not the token ids: Llama tokenizers prepend BOS, so an
-    # empty prompt still encodes to one token.
-    if not req.prompt:
+    prompts = [req.prompt] if isinstance(req.prompt, str) else list(req.prompt)
+    if not prompts:
         raise HTTPException(status_code=400, detail="prompt must not be empty.")
-    seq = _build_sequence(req.prompt, req)
-    _check_fits(seq.prompt_length, req.max_tokens)
+    # Check the strings, not the token ids: Llama tokenizers prepend BOS, so an
+    # empty prompt still encodes to one token.
+    if any(not p for p in prompts):
+        raise HTTPException(status_code=400, detail="prompt must not be empty.")
+
+    # Validate every prompt before submitting any, so a bad one rejects the
+    # whole request instead of leaving a half-submitted batch running.
+    seqs = [_build_sequence(p, req) for p in prompts]
+    for seq in seqs:
+        _check_fits(seq.prompt_length, req.max_tokens)
     request_id = f"cmpl-{uuid.uuid4().hex[:24]}"
 
+    submitted: list[Sequence] = []
     try:
-        engine.submit(seq)
+        for seq in seqs:
+            engine.submit(seq)
+            submitted.append(seq)
     except QueueFullError as exc:
+        for seq in submitted:
+            engine.abort(seq)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     if req.stream:
         return StreamingResponse(
-            _stream_completion(seq, req, request_id), media_type="text/event-stream"
+            _stream_completion(seqs, req, request_id), media_type="text/event-stream"
         )
 
-    async for _ in engine.generate(seq):
-        pass
+    async def run(seq: Sequence) -> None:
+        async for _ in engine.generate(seq):
+            pass
 
-    text = tokenizer.decode(seq.generated_token_ids, skip_special_tokens=True)
-    finish_reason = seq.finish_reason or "stop"
-    stops = seq.sampling_params.stop_strings
-    if stops:
-        text, hit_stop = _apply_stop(text, stops, final=True)
-        if hit_stop:
-            finish_reason = "stop"
-    return CompletionResponse(
-        id=request_id,
-        model=req.model,
-        choices=[CompletionChoice(text=text, index=0, finish_reason=finish_reason)],
-    )
+    await asyncio.gather(*(run(seq) for seq in seqs))
+
+    choices = []
+    for i, seq in enumerate(seqs):
+        text = tokenizer.decode(seq.generated_token_ids, skip_special_tokens=True)
+        finish_reason = seq.finish_reason or "stop"
+        stops = seq.sampling_params.stop_strings
+        if stops:
+            text, hit_stop = _apply_stop(text, stops, final=True)
+            if hit_stop:
+                finish_reason = "stop"
+        choices.append(CompletionChoice(text=text, index=i, finish_reason=finish_reason))
+    return CompletionResponse(id=request_id, model=req.model, choices=choices, usage=_usage(seqs))
+
+
+@app.get("/v1/models")
+async def list_models():
+    return ModelList(data=[ModelCard(id=state["model_name"], created=state["created"])])
 
 
 @app.get("/health")
